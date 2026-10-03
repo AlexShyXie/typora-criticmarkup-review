@@ -7,7 +7,7 @@ import { DEFAULT_REVIEW_SETTINGS, type ReviewSettings } from './settings/model'
 import { ReviewSettingsTab } from './settings/settings-tab'
 import { ReviewController } from './actions/review-controller'
 import { replaceSelectionWith } from './actions/writeback'
-import { promptText } from './actions/comment-modal'
+import { promptText, captureEditableRange, restoreEditableRange } from './actions/comment-modal'
 import { CriticRenderService, findCursorTarget } from './render/critic-processor'
 import { RightDockPlacement } from './placement/right-dock'
 import {
@@ -41,6 +41,14 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
     // Write-backs settle early (park caret + direct re-render) instead of
     // waiting for the framework's ~400ms observer round-trip.
     this.controller.setAfterWrite(() => this.renderService.process(editor.writingArea))
+
+    // v0.3.2 same-frame repair: Typora re-renders a line's inline DOM on
+    // SPACE (dropping our wrapper spans) while the framework only re-runs
+    // post-processors after ~400ms, which painted raw source for that long.
+    // The guard repairs in the mutation microtask, i.e. before paint.
+    const attachGuard = () => this.renderService.attachMutationGuard(editor.writingArea)
+    if (editor.writingArea) attachGuard()
+    else setTimeout(attachGuard, 300)
 
     // Editor / preview rendering through the framework post-processor.
     // NOTE: the framework itself re-runs our processor on every 'edit'
@@ -128,6 +136,9 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
   }
 
   onunload() {
+    // Detach the guard FIRST: unwrapAll removes our wrapper spans and the
+    // mutation guard would otherwise re-wrap them right back.
+    this.renderService?.dispose()
     this.renderService?.unwrapAll(editor.writingArea)
     this.controller?.detachPanel()
     this.placement?.dispose()
@@ -204,11 +215,16 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
       editor.EditHelper.showNotification('CriticMarkup: select some text first')
       return
     }
+    // The modal focuses its input ~30ms after opening, which empties the
+    // document selection — capture the range first and restore it before
+    // writing, or the paste pipeline has nothing to replace (v0.3.1).
+    const savedRange = captureEditableRange()
     promptText({
       title: `Replace: ${selection.slice(0, 60)}${selection.length > 60 ? '…' : ''}`,
       placeholder: 'Replacement text…',
       confirmLabel: 'Replace',
       onConfirm: (newText) => {
+        restoreEditableRange(savedRange)
         replaceSelectionWith(editor, buildSubstitution(selection, newText))
         this.schedulePanelRefresh()
       },

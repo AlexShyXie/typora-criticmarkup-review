@@ -406,7 +406,11 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
       text.className = 'critic-comment-body'
       text.textContent = entry.thread.first.body || '(empty comment)'
       if (!entry.thread.first.body) text.classList.add('critic-comment-empty')
-      text.onclick = () => {
+      text.title = 'Double-click to edit'
+      // v0.3.1: DOUBLE-click enters editing (single click stays free for
+      // selection), per user preference for comments and replies alike.
+      text.ondblclick = (e) => {
+        e.preventDefault() // no word-selection flash on double click
         this.editingKey = entry.id
         this.replyingKey = null
         this.editingReply = null
@@ -435,9 +439,11 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
         const rBody = document.createElement('div')
         rBody.className = 'critic-reply-body'
         rBody.textContent = reply.body
-        // v0.3.0: clicking a reply row opens an inline editor for THAT
-        // reply (was dead — replies could never be edited from the panel).
-        const open = () => {
+        // v0.3.1: DOUBLE-click a reply row to edit it (single click stays
+        // free for reading/selecting); preventDefault kills the word
+        // selection a double click would otherwise flash.
+        const open = (e?: MouseEvent) => {
+          e?.preventDefault()
           this.editingReply = { entryId: entry.id, index: replyIndex }
           this.editingKey = null
           this.replyingKey = null
@@ -446,8 +452,11 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
             `textarea[data-edit-reply="${CSS.escape(entry.id)}"][data-reply-index="${replyIndex}"]`,
           )?.focus()
         }
-        rHead.onclick = open
-        rBody.onclick = open
+        const openEdit = (e: MouseEvent) => open(e)
+        rHead.title = 'Double-click to edit'
+        rBody.title = 'Double-click to edit'
+        rHead.ondblclick = openEdit
+        rBody.ondblclick = openEdit
         r.append(rHead, rBody)
       }
       body.append(r)

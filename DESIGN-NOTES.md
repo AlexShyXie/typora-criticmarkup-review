@@ -1,6 +1,25 @@
 # CriticMarkup Review for Typora — 设计决策速查
 
-> v0.3.0（2026-10-03 晚第七轮）。所有决策均已用户拍板或由调研证实。
+> v0.3.1（2026-10-03 深夜第八轮）。所有决策均已用户拍板或由调研证实。
+
+## v0.3.1 md-meta 真相模型（第八轮实测六问题，推翻"消费"理论）
+
+**重大更正**：Typora 1.14.10 从未把 `==`/`~~` 从 DOM 删除。重载后 `{==软件的潜==}` 的真实 DOM = `{`文本 + `<mark>` 内含 `<span class="md-meta">==</span>` + 正文 + `<span class="md-meta">==</span>` + `}`文本（证据：base-control.css `.md-meta{display:none}`、base.css `mark{background:#ff0}`、`.md-expand mark .md-meta{opacity:.3!important}`）。textContent 里源码完整、token 正常解析——v0.2.1/v0.3.0 的"消费态检测"是对重载场景的误诊（从未命中）。
+
+1. **金黄高亮 + `====` 显示不出（问题1）**：金黄 = 原生 mark 的 `#ff0` 底色透出；`==` 显示不出 = md-meta 被 display:none 藏着，is-raw 只能显示自己 span 里的纯文本。修复（纯 CSS，style.scss v0.3.1）：`mark:has([data-critic-raw-key])` 背景透明化（自有 critic-highlight 提供蛋黄色）、`[data-critic-raw-key].is-raw .md-meta` 强制 display:inline/opacity:1（特异性压过 Typora 两条规则）、is-raw 内克隆壳 mark/del 中性化。锚点 reveal 从此显示完整 `{==软件的潜==}`。
+2. **F1 Replace 无效（问题2）**：comment-modal 的 promptText 在 30ms 后 input.focus() 抢走文档选区，确认时 pasteHandler 无处可贴。修复：弹窗打开前 captureEditableRange()，confirm 先 restoreEditableRange()（恢复 Range + focus 回 contenteditable host）再回调 onConfirm。
+3. **替换标记新词也有删除线（问题3）**：旧词+`~>`+新词全在原生 `<del>` 里，line-through 波及全部。修复：`del/s/strike:has([data-critic-raw-key])` text-decoration:none + color:inherit；旧词由 critic-subst-old 自带红删除线、新词绿色干净、`~>` 隐藏；reveal 时 md-meta 显示 `~~`。
+4. **行尾清除吃换行 + 时不时失效（问题4）**：locateOffset 用严格 `<`，range 终点落在文本节点末尾时跳到下一块首节点 → 选区跨块 → 空串 paste 合并段落。修复：locateOffset 增加 preferEnd（终点=节点末尾时留在本节点），performReplace 的 end 与 moveCaretToKey/parkCaretPast 均启用；findCursorTarget 增加选区锚元素回退（wrapper closest + 消费元素 contains），光标停在零宽徽章边界也能命中。
+5. **编辑闪烁 + 中文重复（问题5）**：三因叠加——进入光标块首键 hashSig 失配触发 unwrap+rewrap+restoreCaret 摧毁 IME 组合；staleKey 自愈在打字时必触发（解析 raw 已漂移而 wrapper key 旧）；reveal 按解析 key 匹配。修复：双签名方案（criticSig=上次完整包裹的文本哈希 + criticCaret='C:单元数' 光标态盖章）——光标块仅单元数变化或 wrapper 缺失才重包裹，打字期间零 DOM 手术；reveal 改 resolveReveal 三级解析（wrapper 键优先 → 偏移 → 消费元素），key 与单元解耦，打字中照常显示源码；离开光标块时 processBlock 按 criticSig 失配触发一次完整重包裹刷新漂移的 key。删除 staleKey/hasWrapperForKey/revealTargetByWrapper。
+6. **面板双击编辑（问题6，用户拍板）**：评论正文与回复行 onclick → ondblclick（+title 提示 + user-select:none 防双击选词闪烁）；Edit/Reply/Resolve 按钮保持单击。
+
+**消费形态守卫**：detectConsumedAnchors 跳过文本以 `==` 开头且结尾的 mark（源码完整，token 已覆盖）；detectConsumedSubstitutions 本就跳过 token 覆盖区间。真消费形态（语法确实不在 DOM）仍走 v0.3.0 的伪元素合成路径。
+
+**收尾补齐（本轮执行时落定）**：
+
+- `locateOffset` 抽到纯模块 `src/critic/text-offset.ts`（只读 textContent，可脱离 DOM 单测），`preferEnd` 语义固定为"终点=节点末尾时留在本节点"；`performReplace` 仅 end 端、`moveCaretToKey`/`parkCaretPast` 停靠启用。新增 `test/critic-core.test.ts` 边界用例 9 条（块尾、空节点、流末、越界、泛型节点类型）。
+- `:has()` 之外补 `.critic-native-host` 类规则：`syncNativeHostClasses` 盖在承载我们 span 的原生 mark/del 上，`:has` 不可用或失效时仍能中和原生金黄/删除线（此前该类无对应样式，等于空转）。
+- 清理 `planConsumedAnchorSegments` 的重复实现（TS2393），保留 v0.3.2 版本（accepted view 下花括号也隐藏）。
 
 ## v0.3.0 reveal 单元模型（第七轮实测五问题）
 
@@ -80,7 +99,7 @@
 
 ## 交付状态
 
-- vitest 44/44 全绿；tsc --noEmit 零错误；esbuild 生产构建通过
+- vitest 23/23 全绿（critic-thread 14 + critic-core 9）；tsc --noEmit 零错误；esbuild 生产构建通过
 - 产物：dist/main.js + dist/main.css + manifest.json → criticmarkup-review.zip
 - v0.1.0 的三个问题均已修复（根因见上）；**修复效果待用户实机复测**
 

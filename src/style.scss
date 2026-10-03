@@ -154,6 +154,74 @@
   color: inherit;
 }
 
+/* v0.3.1 truth model: Typora NEVER deletes `==` / `~~` on reload — the
+   delimiters live INSIDE the native mark/del as hidden `.md-meta` spans
+   (base-control.css: `.md-meta{display:none}`), and the native element's
+   own decoration paints over ours (`mark{background:#ff0}`, del
+   line-through covering the new word). Three pure-CSS takeovers:
+
+   1. A native mark/del that HOSTS one of our segment spans (wrapSegment
+      inserts the text wrappers inside it) loses its own decoration —
+      our .critic-highlight / .critic-subst-* provide the styling. Without
+      this the anchor reads golden #ff0 and the substitution's NEW word
+      inherits the strike-through. */
+mark:has([data-critic-raw-key]) {
+  background: transparent !important;
+  color: inherit !important;
+}
+
+del:has([data-critic-raw-key]),
+s:has([data-critic-raw-key]),
+strike:has([data-critic-raw-key]) {
+  text-decoration: none !important;
+  color: inherit !important;
+}
+
+/* Same takeover as a plain class: the renderer stamps `.critic-native-host`
+   on the native element hosting our spans (see syncNativeHostClasses). If
+   `:has()` is unavailable or its invalidation misses a dynamically inserted
+   span, this rule is the deterministic fallback — without it Typora's
+   golden `#ff0` / del line-through would still bleed through. */
+mark.critic-native-host {
+  background: transparent !important;
+  color: inherit !important;
+}
+
+del.critic-native-host,
+s.critic-native-host,
+strike.critic-native-host {
+  text-decoration: none !important;
+  color: inherit !important;
+}
+
+/* 2. Revealing a unit must also unfold Typora's hidden syntax spans.
+   `.is-raw .md-meta` out-specifies both `.md-meta{display:none}` and
+   `.md-expand mark .md-meta{opacity:.3!important}`, so the real `==` /
+   `~~` characters become visible inside the revealed delimiters — this is
+   what finally makes `====` show up when the anchor is revealed. */
+[data-critic-raw-key].is-raw .md-meta {
+  display: inline !important;
+  width: auto !important;
+  opacity: 1 !important;
+  font-size: inherit !important;
+  line-height: inherit !important;
+}
+
+/* 3. wrapSegment's extractContents clones the partially-containing
+   mark/del shells INTO our delimiter spans; neutralize those clones while
+   revealed, so the synthesized `==` / `~~` is not boxed or struck. */
+[data-critic-raw-key].is-raw mark {
+  background: transparent !important;
+  color: inherit !important;
+}
+
+[data-critic-raw-key].is-raw del,
+[data-critic-raw-key].is-raw s,
+[data-critic-raw-key].is-raw strike {
+  text-decoration: none !important;
+  color: inherit !important;
+}
+
 /* Toolbar rows: keep both spans equally wide. */
 .critic-toolbar-actions,
 .critic-toolbar-modes {
@@ -508,7 +576,15 @@ textarea.critic-modal-input {
   margin: 6px 0;
   word-break: break-word;
   white-space: pre-wrap;
-  cursor: text;
+  cursor: default;
+}
+
+/* v0.3.1: comment bodies & reply rows enter editing on DOUBLE-click —
+   kill text selection so the double-click word highlight never flashes. */
+.critic-comment-body,
+.critic-reply-head,
+.critic-reply-body {
+  user-select: none;
 }
 
 .critic-comment-empty {

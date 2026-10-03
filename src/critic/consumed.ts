@@ -59,3 +59,55 @@ export function findConsumedSubstitutionRanges(
   }
   return out
 }
+
+/** A `{text}` shape in block text — candidate consumed (standalone) anchor. */
+export interface ConsumedAnchorRange {
+  /** Offset of the opening `{`. */
+  from: number
+  /** Offset past the closing `}` (exclusive). */
+  to: number
+  /** Text between the braces (the `==` are gone in the consumed shape). */
+  text: string
+  /** `{text}` — the DOM-space raw used for raw-key / write-back matching. */
+  raw: string
+}
+
+/**
+ * Scan block text for consumed-anchor shapes, skipping regions already
+ * covered by parsed source-form tokens.
+ *
+ * v0.3.2: Typora's live parser eats the `==` of a `{==text==}` anchor as
+ * soon as the user finishes typing it (that is why a freshly typed
+ * standalone `{==important==}` reports `{important}` in `textContent`), so
+ * the source-form regex no longer sees a token. Unlike consumed
+ * substitutions, consumed anchors used to be rejected unless a comment
+ * block followed — leaving standalone anchors to Typora's native golden
+ * `<mark>`. The renderer now validates each candidate against a real
+ * `<mark>` element (see `detectConsumedAnchors`), so prose braces such as
+ * `{see below}` never produce a phantom unit.
+ */
+export function findConsumedAnchorRanges(
+  text: string,
+  skipRanges: ReadonlyArray<{ from: number; to: number }> = [],
+): ConsumedAnchorRange[] {
+  const out: ConsumedAnchorRange[] = []
+  const re = /\{([^{}\n]+)\}/g
+  re.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text))) {
+    const from = m.index
+    const to = from + m[0].length
+    if (skipRanges.some(r => from < r.to && r.from < to)) continue
+    const content = m[1] ?? ''
+    // Source form still present (Typora kept the `==` as hidden .md-meta
+    // spans after a reload) — the token path owns that shape.
+    if (content.length >= 4 && content.startsWith('==') && content.endsWith('==')) continue
+    // Not an anchor: substitution / addition / deletion shapes belong to
+    // their own scanners (or to the token path).
+    if (content.includes(SYNTAX.SUBSTITUTION_JOIN)) continue
+    if (/^(?:\+\+|--|>>)/.test(content) || /(?:\+\+|--|<<)$/.test(content)) continue
+    if (!content.trim()) continue
+    out.push({ from, to, text: content, raw: m[0] })
+  }
+  return out
+}

@@ -81,3 +81,38 @@ export function promptText(options: PromptOptions): void {
     if (!options.multiline) (input as HTMLInputElement).select()
   }, 30)
 }
+
+/**
+ * Non-collapsed selection with actual text (the write-back target).
+ *
+ * The modal focuses its own input 30ms after opening, which makes the
+ * document lose its selection — a write-back that only runs in `onConfirm`
+ * would then have nothing to replace (v0.3.1: F1 "Mark Selection as
+ * Replace" silently did nothing). Callers capture the range BEFORE opening
+ * the modal and restore it at the top of `onConfirm`.
+ */
+export function captureEditableRange(): Range | null {
+  const sel = window.getSelection()
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null
+  const r = sel.getRangeAt(0)
+  if (!r.toString()) return null
+  return r.cloneRange()
+}
+
+/**
+ * Put a captured range back and focus its contenteditable host.
+ * Focus first, selection second: focusing an editable resets the caret.
+ */
+export function restoreEditableRange(range: Range | null): void {
+  if (!range) return
+  try {
+    const startEl = range.startContainer.nodeType === Node.TEXT_NODE
+      ? range.startContainer.parentElement
+      : (range.startContainer as Element)
+    const host = startEl?.closest('[contenteditable="true"]') as HTMLElement | null
+    host?.focus()
+    const sel = window.getSelection()
+    sel?.removeAllRanges()
+    sel?.addRange(range)
+  } catch { /* best effort */ }
+}

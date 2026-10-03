@@ -25,6 +25,7 @@ import type {
 import type { ReviewPanelData, ReviewViewActions } from '../panel/review-view'
 import type { ReviewSettings } from '../settings/model'
 import { replaceSelectionWith } from '../actions/writeback'
+import { locateOffset } from '../critic/text-offset'
 
 /**
  * Central data flow: parse the live markdown, feed the panel, and perform
@@ -134,7 +135,10 @@ export class ReviewController {
         if (best !== -1) break
       }
       if (best === -1) return
-      const pos = locateOffset(nodes, starts, best + 3)
+      // preferEnd: a caret landing exactly on a text node's end stays on
+      // that node — the next one may belong to the following block, and
+      // parking there would reveal/attach to the wrong line (v0.3.1).
+      const pos = locateOffset(nodes, starts, best + 3, true)
       if (!pos) return
       const r = document.createRange()
       r.setStart(pos.node, pos.offset)
@@ -457,8 +461,13 @@ export class ReviewController {
     expected: string, replacement: string,
   ): void {
     const range = document.createRange()
+    // START keeps the default (`<`): the beginning of the token belongs to
+    // the node the token starts in. END uses preferEnd, otherwise a token
+    // ending exactly at a text node's end hops into the NEXT block and the
+    // selection — once replaced with shorter/empty text — swallows the line
+    // break (v0.3.1: "strip at end of line merged the next paragraph").
     const start = locateOffset(nodes, starts, best)
-    const end = locateOffset(nodes, starts, best + expected.length)
+    const end = locateOffset(nodes, starts, best + expected.length, true)
     if (!start || !end) {
       editor.EditHelper.showNotification('CriticMarkup: cannot locate range')
       return
@@ -560,17 +569,15 @@ export class ReviewController {
       if (end === -1) return // caret not inside any occurrence
 
       // Locate `end` in the live node list and collapse the caret there.
-      for (let i = 0; i < nodes.length; i++) {
-        const len = nodes[i].textContent?.length ?? 0
-        if (end < starts[i] + len || (end === starts[i] + len && i === nodes.length - 1)) {
-          const nr = document.createRange()
-          nr.setStart(nodes[i], Math.min(end - starts[i], len))
-          nr.collapse(true)
-          sel.removeAllRanges()
-          sel.addRange(nr)
-          return
-        }
-      }
+      // preferEnd keeps an end-of-text-node caret on that node instead of
+      // dropping it into the next block (v0.3.1).
+      const pos = locateOffset(nodes, starts, end, true)
+      if (!pos) return
+      const nr = document.createRange()
+      nr.setStart(pos.node, pos.offset)
+      nr.collapse(true)
+      sel.removeAllRanges()
+      sel.addRange(nr)
     } catch { /* best-effort; never block a write-back */ }
   }
 
@@ -621,20 +628,4 @@ function streamIndexOfEl(el: HTMLElement, nodes: Text[], starts: number[]): numb
   return i >= 0 ? starts[i] : -1
 }
 
-function locateOffset(
-  nodes: Text[],
-  starts: number[],
-  offset: number,
-): { node: Text; offset: number } | null {
-  for (let i = 0; i < nodes.length; i++) {
-    const len = nodes[i].textContent?.length ?? 0
-    if (offset < starts[i] + len) {
-      return { node: nodes[i], offset: offset - starts[i] }
-    }
-  }
-  const last = nodes[nodes.length - 1]
-  if (last) {
-    return { node: last, offset: (last.textContent?.length ?? 0) }
-  }
-  return null
-}
+

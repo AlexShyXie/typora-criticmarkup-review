@@ -1,6 +1,9 @@
 import { HtmlPostProcessor } from '@typora-community-plugin/core'
 import { CriticParser } from '../critic/parser'
-import { findConsumedSubstitutionRanges } from '../critic/consumed'
+import {
+  findConsumedAnchorRanges,
+  findConsumedSubstitutionRanges,
+} from '../critic/consumed'
 import { SYNTAX } from '../critic/syntax'
 import type {
   AdditionToken,
@@ -34,11 +37,20 @@ import type {
  * anchored `{==text==}` and every `{>>...<<}` block are separate tokens,
  * each with its own `data-critic-raw-key`. The anchor and every comment
  * reveal INDEPENDENTLY (click anchor → `{==text==}` only; click ASK badge →
- * ASK raw only; click REPLY badge → REPLY raw only). Typora-consumed shapes
- * (`{<mark>text</mark>}`, `{<del>old~>new</del>}`) become their own units:
- * revealing them synthesizes the eaten `==` / `~~` via CSS pseudo-elements
- * on the native element, so `{==软件的潜==}` shows complete even after the
- * characters themselves are gone from the DOM.
+ * ASK raw only; click REPLY badge → REPLY raw only).
+ *
+ * v0.3.1 TRUTH MODEL (corrects the v0.3.0 "consumed shapes" theory):
+ * Typora never removes the `==` / `~~` syntax characters. After a reload
+ * `{==text==}` lives in the DOM as `{` + `<mark>` wrapping
+ * `<span class="md-meta">==</span>` + text + `<span class="md-meta">==</span>`
+ * + `}` — the glyphs are Typora's own `.md-meta` spans, hidden by
+ * `.md-meta{display:none}`, and the native mark/del decorations
+ * (`mark{background:#ff0}`, del line-through) paint OVER our styles. The
+ * renderer therefore only needs to (a) keep the per-unit wrap/reveal model
+ * and (b) let the stylesheet take over the native elements and force-show
+ * `.md-meta` inside revealed units (style.scss v0.3.1). Typing inside a
+ * unit must NEVER rewrap (IME composition safety): see processCaretBlock's
+ * caret-stamp fast paths.
  */
 
 const LEAF_BLOCK_SELECTOR = [
@@ -104,29 +116,37 @@ function textRangeOf(root: HTMLElement, el: HTMLElement): { from: number; to: nu
 }
 
 /**
- * Element-driven consumed-anchor detection: a native `<mark>` whose text is
- * wrapped in literal braces and directly followed (whitespace only) by a
- * comment token — Typora ate the `==` of the anchored `{==text==}`.
- * Standalone consumed highlights (`{==?? ==}` → `{<mark>?? </mark>}`) are
- * NOT units: Typora's own caret reveal already handles them.
+ * Element-driven consumed-anchor detection (v0.3.2): a native `<mark>`
+ * wrapped in literal braces whose `==` Typora already ate — the live editor
+ * does that the instant the user finishes typing `{==important==}`, so
+ * `textContent` reports `{important}` and the source-form regex can no
+ * longer see a token.
+ *
+ * v0.3.2 change: detection used to require a following `{>>...<<}` comment
+ * (plus "directly followed" whitespace), which left STANDALONE consumed
+ * anchors completely unwrapped — the user saw Typora's native golden
+ * `<mark>` with the literal braces beside it. It is now candidate-driven,
+ * exactly like consumed substitutions: `findConsumedAnchorRanges` proposes
+ * and the `<mark>` element check rejects prose braces (`{see below}`) and
+ * md-meta shapes (still `==text==`, owned by the token path).
  */
 function detectConsumedAnchors(
   block: HTMLElement, text: string, tokens: CriticToken[],
 ): RevealUnit[] {
+  const skip = tokens.map(t => ({ from: t.from, to: t.to }))
+  const candidates = findConsumedAnchorRanges(text, skip)
   const units: RevealUnit[] = []
-  const comments = tokens.filter(t => t.type === 'comment')
-  if (comments.length === 0) return units
+  if (candidates.length === 0) return units
   block.querySelectorAll<HTMLElement>('mark').forEach(mark => {
     const r = textRangeOf(block, mark)
     if (!r) return
     if (text[r.from - 1] !== '{' || text[r.to] !== '}') return
-    const paired = comments.some(t => /^\s*$/.test(text.slice(r.to + 1, t.from)))
-    if (!paired) return
-    const markText = text.slice(r.from, r.to)
+    const cand = candidates.find(c => c.from === r.from - 1 && c.to === r.to + 1)
+    if (!cand) return
     units.push({
-      from: r.from - 1,
-      to: r.to + 1,
-      key: `{${markText}}`,
+      from: cand.from,
+      to: cand.to,
+      key: cand.raw,
       margin: 1,
       kind: 'consumed-anchor',
       el: mark,
@@ -253,6 +273,24 @@ export function findCursorTarget(): { token: CriticToken; block: HTMLElement } |
       if (token) return { token, block }
     }
   }
+  // v0.3.1: the caret often parks on a wrapper's zero-width boundary (chip
+  // badges are font-size: 0) or inside a consumed native element — offset
+  // matching then misses ("no markup at cursor" despite a clear target).
+  // Fall back to the wrapper the selection anchor sits in, then to the
+  // consumed element containing it.
+  const wrapper = el.closest<HTMLElement>('[data-critic-raw-key]')
+  if (wrapper && block.contains(wrapper)) {
+    const key = wrapper.dataset.criticRawKey ?? ''
+    const u = units.find(x => x.key === key)
+    const token = u ? unitToToken(u, text) : null
+    if (token) return { token, block }
+  }
+  for (const u of units) {
+    if (u.kind !== 'token' && u.el && u.el.contains(el)) {
+      const token = unitToToken(u, text)
+      if (token) return { token, block }
+    }
+  }
   return null
 }
 
@@ -261,6 +299,25 @@ export class CriticRenderService {
 
   private processor: HtmlPostProcessor | null = null
   private lastCaretBlock: HTMLElement | null = null
+
+  /** v0.3.2 same-frame repair guard (see attachMutationGuard). */
+  private guardObserver: MutationObserver | null = null
+  private guardRoot: HTMLElement | null = null
+  private composing = false
+  private surgery = false
+  private readonly onCompositionStart = (): void => {
+    this.composing = true
+  }
+  private readonly onCompositionEnd = (): void => {
+    this.composing = false
+    const root = this.guardRoot
+    if (!root) return
+    // The composition just committed text — re-evaluate the caret block on
+    // the next tick (the DOM settles after compositionend).
+    setTimeout(() => {
+      if (root.isConnected) this.handleCaretMove(root)
+    }, 0)
+  }
 
   buildProcessor(): HtmlPostProcessor {
     if (this.processor) return this.processor
@@ -334,7 +391,102 @@ export class CriticRenderService {
    * All tokens are ALWAYS wrapped — raw vs rendered is a pure CSS class
    * toggle on the revealed unit's segments. Text nodes are never
    * created/destroyed during a reveal transition, so the caret stays put.
+   *
+   * v0.3.1 rewrap policy: the caret block only rewraps when the unit COUNT
+   * changed (structure edit) or the wrappers are actually gone. Typing
+   * INSIDE a unit keeps the count stable and must not rewrap — a rewrap
+   * destroys text nodes, which flashes the block on every keystroke and
+   * kills the IME composition session (duplicated CJK input). The reveal
+   * stays stable meanwhile because it is keyed off the wrapper's own raw
+   * key (see resolveReveal rule 1), which does not drift while typing.
    */
+  /**
+   * v0.3.2 SAME-FRAME REPAIR GUARD.
+   *
+   * Typora re-renders a line's inline DOM when the user presses SPACE (that
+   * is when its markdown inline parser re-runs), and re-rendering drops our
+   * wrapper spans. The community framework only re-runs post-processors
+   * after `MutationObserver(debounce(emitEdit, 400))` (core.js), so the raw
+   * source text was painted for up to 400ms — the "whole line flashes into
+   * source" the user reported.
+   *
+   * MutationObserver callbacks are microtasks: they run when the task that
+   * mutated the DOM ends, i.e. BEFORE the browser paints. Repairing here
+   * puts Typora's re-render and our re-wrap in the same frame, so the raw
+   * frame never reaches the screen.
+   *
+   * Deliberately observes childList/characterData only (not attributes):
+   * our own `dataset` writes and class toggles must not feed back. Our
+   * surgery does produce childList records, but the follow-up pass hits a
+   * fast path and changes nothing, so the loop converges in one extra pass.
+   */
+  attachMutationGuard(root: HTMLElement): void {
+    this.detachMutationGuard()
+    this.guardRoot = root
+    try {
+      this.guardObserver = new MutationObserver(records => this.onGuardMutations(records))
+      this.guardObserver.observe(root, { childList: true, subtree: true, characterData: true })
+    } catch {
+      this.guardObserver = null
+    }
+    root.addEventListener('compositionstart', this.onCompositionStart, true)
+    root.addEventListener('compositionend', this.onCompositionEnd, true)
+  }
+
+  /** Stop the guard (plugin unload / re-attach). */
+  detachMutationGuard(): void {
+    this.guardObserver?.disconnect()
+    this.guardObserver = null
+    const root = this.guardRoot
+    if (root) {
+      root.removeEventListener('compositionstart', this.onCompositionStart, true)
+      root.removeEventListener('compositionend', this.onCompositionEnd, true)
+    }
+    this.guardRoot = null
+    this.surgery = false
+    this.composing = false
+  }
+
+  dispose(): void {
+    this.detachMutationGuard()
+    this.lastCaretBlock = null
+  }
+
+  private onGuardMutations(records: MutationRecord[]): void {
+    const root = this.guardRoot
+    if (!root || !root.isConnected) return
+    // IME composition: never run DOM surgery mid-composition — swapping
+    // text nodes under the caret is what duplicated CJK input before.
+    if (this.composing || this.surgery) return
+    if (this.acceptedView) return
+
+    const blocks = new Set<HTMLElement>()
+    for (const record of records) {
+      const node = record.target
+      if (!node || !root.contains(node)) continue
+      const el = node.nodeType === Node.TEXT_NODE
+        ? node.parentElement
+        : (node as HTMLElement)
+      const block = el?.closest<HTMLElement>(LEAF_BLOCK_SELECTOR) ?? null
+      if (block && root.contains(block)) blocks.add(block)
+    }
+    if (blocks.size === 0) return
+
+    const caret = this.findCaret(root)
+    this.surgery = true
+    try {
+      for (const block of blocks) {
+        if (block === caret?.block) {
+          this.processCaretBlock(block, caret.offset, caret.anchorEl)
+        } else {
+          this.processBlock(block)
+        }
+      }
+    } finally {
+      this.surgery = false
+    }
+  }
+
   private processCaretBlock(block: HTMLElement, caretOffset: number, anchorEl: HTMLElement | null): void {
     this.lastCaretBlock = block
     const text = block.textContent ?? ''
@@ -344,54 +496,53 @@ export class CriticRenderService {
     const units = buildRevealUnits(block, text, tokens)
     this.syncConsumedClasses(block, units)
 
-    // 1) Caret-based reveal: the unit whose interior (with margins) holds
-    //    the caret. Consumed units use margin 1 (`{`/`}` only); token units
-    //    use 3 (`{==`, `{>>`, …).
-    let reveal = this.revealUnitForCaret(units, caretOffset)
+    const reveal = this.resolveReveal(block, caretOffset, anchorEl, units)
 
-    // 2) Click-based reveal: the click landed on rendered chrome (our
-    //    wrapper, a consumed mark, a consumed del) — reveal THAT unit only.
-    if (!reveal && anchorEl) {
-      reveal = this.revealTargetByWrapper(block, anchorEl, units)
-    }
-
+    const textSig = (this.acceptedView ? 'A:' : '') + text.length + ':' + hashText(text)
     const caretSig = (this.acceptedView ? 'A:' : '') + 'C:' + units.length
-    const hashSig = (this.acceptedView ? 'A:' : '') + text.length + ':' + hashText(text)
-    const stored = block.dataset.criticSig
     const expectWraps = tokens.length > 0 || units.some(u => u.kind !== 'token')
-    const staleKey = reveal !== null && reveal.kind === 'token'
-      && !this.hasWrapperForKey(block, reveal.key)
-    // Structure is valid when the stored signature matches either the caret
-    // format (same unit count — typing inside a token keeps spans intact)
-    // or the hash format (text unchanged since the last full render), AND
-    // the wrappers are actually present (Typora may have rebuilt the block),
-    // AND the revealed unit's wrapper actually exists (stale-key self-heal).
-    if ((stored !== caretSig && stored !== hashSig)
-      || !this.wrappersMatch(block, expectWraps)
-      || staleKey) {
-      // Rewrap (rare: Typora rebuilt the block). The surgery destroys text
-      // nodes — restore the caret to its exact offset afterwards, or the
-      // browser flings it to the block start.
-      this.unwrapBlock(block)
-      const segments: Segment[] = []
-      for (const token of tokens) {
-        this.planToken(token, segments)
-      }
-      for (const unit of units) {
-        if (unit.kind === 'consumed-subst') {
-          this.planConsumedSubstSegments(unit, text, segments)
-        }
-      }
-      if (segments.length > 0) {
-        segments
-          .slice()
-          .sort((a, b) => b.from - a.from)
-          .forEach(seg => this.wrapSegment(block, seg))
-      }
-      block.dataset.criticSig = caretSig
-      this.restoreCaret(block, caretOffset)
+
+    // Fast path A — caret stamp current (typing inside a unit): keep the
+    // spans, only sync the reveal classes.
+    if (block.dataset.criticCaret === caretSig && this.wrappersMatch(block, expectWraps)) {
+      this.syncRawState(block, reveal.key, reveal.unit)
+      return
     }
-    this.syncRawState(block, reveal)
+    // Fast path B — text unchanged since the last full wrap: just stamp
+    // the caret format. Entering caret mode must NOT rewrap, or the FIRST
+    // keystroke after a click would destroy the composition session.
+    if (block.dataset.criticSig === textSig && this.wrappersMatch(block, expectWraps)) {
+      block.dataset.criticCaret = caretSig
+      this.syncRawState(block, reveal.key, reveal.unit)
+      return
+    }
+
+    // Full rewrap (unit count changed, or Typora rebuilt the block). The
+    // surgery destroys text nodes — restore the caret to its exact offset
+    // afterwards, or the browser flings it to the block start.
+    this.unwrapBlock(block)
+    const segments: Segment[] = []
+    for (const token of tokens) {
+      this.planToken(token, segments)
+    }
+    for (const unit of units) {
+      if (unit.kind === 'consumed-subst') {
+        this.planConsumedSubstSegments(unit, text, segments)
+      }
+    }
+    if (segments.length > 0) {
+      segments
+        .slice()
+        .sort((a, b) => b.from - a.from)
+        .forEach(seg => this.wrapSegment(block, seg))
+    }
+    block.dataset.criticSig = textSig
+    block.dataset.criticCaret = caretSig
+    this.restoreCaret(block, caretOffset)
+    // v0.3.2: the native mark/del hosting our spans is neutralized by CLASS
+    // (:has() alone proved unreliable) — recomputed after every wrap.
+    this.syncNativeHostClasses(block)
+    this.syncRawState(block, reveal.key, reveal.unit)
   }
 
   /** The unit whose interior (margin-adjusted) contains the caret offset. */
@@ -403,30 +554,37 @@ export class CriticRenderService {
     return null
   }
 
-  private hasWrapperForKey(block: HTMLElement, key: string): boolean {
-    return block.querySelector(`[data-critic-raw-key="${CSS.escape(key)}"]`) !== null
-  }
-
   /**
-   * Which unit should go raw for a click that landed on rendered chrome?
-   * - One of our segment spans (chip / mark / anchor / subst segment): its
-   *   unit by raw key.
-   * - A consumed anchor mark or consumed substitution del: that unit
-   *   (click inside the native element reveals ITS source).
+   * v0.3.1 reveal resolution, in priority order:
+   * 1. The wrapper span the caret/click anchor sits in — reveal its OWN
+   *    raw key even when typing has already drifted the parsed raw (this
+   *    is what keeps the reveal rock-stable while editing a unit).
+   * 2. The unit whose margin-adjusted range holds the caret offset
+   *    (consumed units margin 1 `{`/`}`, token units 3 `{==`, `{>>`, …).
+   * 3. A consumed native element (mark/del) containing the anchor.
+   *
+   * `key` and `unit` are decoupled on purpose: rule 1 can produce a key
+   * that no longer matches any parsed unit (mid-typing), and syncRawState
+   * must still reveal it.
    */
-  private revealTargetByWrapper(
-    block: HTMLElement, anchorEl: HTMLElement, units: RevealUnit[],
-  ): RevealUnit | null {
-    const wrapper = anchorEl.closest<HTMLElement>('[data-critic-raw-key]')
-    if (wrapper && block.contains(wrapper)) {
-      const key = wrapper.dataset.criticRawKey ?? ''
-      const unit = units.find(u => u.key === key)
-      if (unit) return unit
+  private resolveReveal(
+    block: HTMLElement, caretOffset: number, anchorEl: HTMLElement | null,
+    units: RevealUnit[],
+  ): { key: string | null; unit: RevealUnit | null } {
+    if (anchorEl) {
+      const wrapper = anchorEl.closest<HTMLElement>('[data-critic-raw-key]')
+      if (wrapper && block.contains(wrapper)) {
+        const key = wrapper.dataset.criticRawKey ?? ''
+        if (key) return { key, unit: units.find(u => u.key === key) ?? null }
+      }
     }
-    for (const u of units) {
-      if (u.kind !== 'token' && u.el && u.el.contains(anchorEl)) return u
+    const byOffset = this.revealUnitForCaret(units, caretOffset)
+    if (byOffset) return { key: byOffset.key, unit: byOffset }
+    if (anchorEl) {
+      const byEl = units.find(u => u.kind !== 'token' && u.el && u.el.contains(anchorEl))
+      if (byEl) return { key: byEl.key, unit: byEl }
     }
-    return null
+    return { key: null, unit: null }
   }
 
   /** Cosmetic classes on the native consumed elements (idempotent). */
@@ -438,6 +596,29 @@ export class CriticRenderService {
     block.querySelectorAll<HTMLElement>('del, s, strike').forEach(del => {
       const isUnit = units.some(u => u.kind === 'consumed-subst' && u.el === del)
       del.classList.toggle('critic-consumed-del', isUnit)
+    })
+    // Runs on every pass (fast paths included): Typora can drop the class
+    // when it re-renders a block, and the golden mark would come back.
+    this.syncNativeHostClasses(block)
+  }
+
+  /**
+   * v0.3.2: neutralize the native element that HOSTS our wrapper spans.
+   *
+   * The stylesheet rule `mark:has([data-critic-raw-key])` does the same job,
+   * but it silently does nothing if `:has()` is unavailable or its
+   * invalidation misses spans we insert dynamically — the symptom is
+   * Typora's `mark{background:#ff0}` golden shining through our highlight.
+   * A plain class is deterministic. Elements already owned by a consumed
+   * unit are skipped: their own class carries the egg-yellow `!important`
+   * background and must win.
+   */
+  private syncNativeHostClasses(block: HTMLElement): void {
+    block.querySelectorAll<HTMLElement>('mark, del, s, strike').forEach(el => {
+      const owned = el.classList.contains('critic-anchor-consumed')
+        || el.classList.contains('critic-consumed-del')
+      const hosts = !owned && el.querySelector('[data-critic-raw-key]') !== null
+      el.classList.toggle('critic-native-host', hosts)
     })
   }
 
@@ -457,33 +638,33 @@ export class CriticRenderService {
   }
 
   /**
-   * Toggle the raw-source classes for the revealed unit (CSS-only):
-   * - token / consumed-subst units: `.is-raw` on every segment carrying the
-   *   unit's raw key (chips flatten; consumed-subst segments flatten and
-   *   the join `~>` unfolds).
-   * - consumed-anchor: `.critic-anchor-reveal` on the native mark (CSS
-   *   synthesizes the eaten `==` on both sides).
+   * Toggle the raw-source classes (CSS-only). `revealKey` may come straight
+   * from a wrapper span (typing inside a unit — the parsed raw has drifted,
+   * the wrapper key has not), so it is decoupled from the unit:
+   * - `.is-raw` on every segment carrying `revealKey` (chips flatten; the
+   *   md-meta `==`/`~~` glyphs inside them are shown by the stylesheet).
+   * - consumed units additionally light `.critic-anchor-reveal` /
+   *   `.critic-subst-reveal` on their native element.
    * Every other element's reveal state is cleared each pass.
    */
-  private syncRawState(block: HTMLElement, reveal: RevealUnit | null): void {
-    const rawKey = reveal ? reveal.key : null
+  private syncRawState(block: HTMLElement, revealKey: string | null, revealUnit: RevealUnit | null): void {
     const segs = block.querySelectorAll<HTMLElement>('[data-critic-raw-key]')
-    segs.forEach(s => s.classList.toggle('is-raw', !!rawKey && s.dataset.criticRawKey === rawKey))
+    segs.forEach(s => s.classList.toggle('is-raw', !!revealKey && s.dataset.criticRawKey === revealKey))
     block.querySelectorAll<HTMLElement>('.critic-anchor-reveal').forEach(el => {
-      if (!reveal || reveal.kind !== 'consumed-anchor' || reveal.el !== el) {
+      if (!revealUnit || revealUnit.kind !== 'consumed-anchor' || revealUnit.el !== el) {
         el.classList.remove('critic-anchor-reveal')
       }
     })
     block.querySelectorAll<HTMLElement>('.critic-subst-reveal').forEach(el => {
-      if (!reveal || reveal.kind !== 'consumed-subst' || reveal.el !== el) {
+      if (!revealUnit || revealUnit.kind !== 'consumed-subst' || revealUnit.el !== el) {
         el.classList.remove('critic-subst-reveal')
       }
     })
-    if (reveal?.kind === 'consumed-anchor' && reveal.el) {
-      reveal.el.classList.add('critic-anchor-reveal')
+    if (revealUnit?.kind === 'consumed-anchor' && revealUnit.el) {
+      revealUnit.el.classList.add('critic-anchor-reveal')
     }
-    if (reveal?.kind === 'consumed-subst' && reveal.el) {
-      reveal.el.classList.add('critic-subst-reveal')
+    if (revealUnit?.kind === 'consumed-subst' && revealUnit.el) {
+      revealUnit.el.classList.add('critic-subst-reveal')
     }
   }
 
@@ -499,21 +680,14 @@ export class CriticRenderService {
     const units = buildRevealUnits(block, text, tokens)
     this.syncConsumedClasses(block, units)
 
-    const sig = (this.acceptedView ? 'A:' : '') + text.length + ':' + hashText(text)
-    const stored = block.dataset.criticSig
+    const textSig = (this.acceptedView ? 'A:' : '') + text.length + ':' + hashText(text)
     const expectWraps = tokens.length > 0 || units.some(u => u.kind !== 'token')
-    if (stored === sig
-      && this.wrappersMatch(block, expectWraps)) {
+    if (block.dataset.criticSig === textSig && this.wrappersMatch(block, expectWraps)) {
       // Fully rendered and current — just make sure no raw reveal lingers
-      // (the block may have just lost the caret).
-      this.syncRawState(block, null)
-      return
-    }
-    // A caret-format signature (C:count) with wrappers still present means
-    // the block was the caret block and is structurally fine — clear the
-    // raw reveal without a needless unwrap/rewrap round.
-    if (stored?.startsWith('C:') && this.wrappersMatch(block, expectWraps)) {
-      this.syncRawState(block, null)
+      // (the block may have just lost the caret). Blocks the user typed in
+      // while the caret was inside land here too: the full rewrap below
+      // refreshes their (stale) wrapper keys the moment the caret leaves.
+      this.syncRawState(block, null, null)
       return
     }
 
@@ -526,18 +700,21 @@ export class CriticRenderService {
     for (const unit of units) {
       if (unit.kind === 'consumed-subst') {
         this.planConsumedSubstSegments(unit, text, segments)
+      } else if (unit.kind === 'consumed-anchor') {
+        this.planConsumedAnchorSegments(unit, segments)
       }
     }
-    if (segments.length === 0) return
+    if (segments.length > 0) {
+      // Back-to-front so earlier offsets remain valid while we mutate.
+      segments
+        .slice()
+        .sort((a, b) => b.from - a.from)
+        .forEach(seg => this.wrapSegment(block, seg))
+    }
 
-    // Back-to-front so earlier offsets remain valid while we mutate the DOM.
-    segments
-      .slice()
-      .sort((a, b) => b.from - a.from)
-      .forEach(seg => this.wrapSegment(block, seg))
-
-    block.dataset.criticSig = sig
-    this.syncRawState(block, null)
+    this.syncNativeHostClasses(block)
+    block.dataset.criticSig = textSig
+    this.syncRawState(block, null, null)
   }
 
   private unwrapBlock(block: HTMLElement): void {
@@ -553,6 +730,7 @@ export class CriticRenderService {
       block.normalize()
     }
     delete block.dataset.criticSig
+    delete block.dataset.criticCaret
   }
 
   /** Caret position as { leaf block, character offset, anchor element }. */
@@ -691,6 +869,28 @@ export class CriticRenderService {
       { from: innerFrom, to: joinFrom, cls: accepted ? 'critic-hidden' : 'critic-subst-old' },
       { from: joinFrom, to: joinFrom + 2, cls: 'critic-subst-join' },
       { from: joinFrom + 2, to: innerTo, cls: 'critic-subst-new' },
+    )
+    for (let i = mark; i < segments.length; i++) {
+      const s = segments[i]
+      s.attrs = { ...(s.attrs ?? {}), 'data-critic-raw-key': unit.key }
+    }
+  }
+
+  /**
+   * v0.3.2: segments for a consumed anchor's literal `{` / `}`.
+   *
+   * In the consumed shape those braces are plain text nodes no token owns,
+   * so they would stay visible beside the (golden) native mark. Wrapping
+   * them in `.critic-mark` hides them in rendered mode and brings them back
+   * with `.is-raw`, so revealing the unit still shows the complete
+   * `{==text==}`: braces from these spans, `==` synthesized by the
+   * stylesheet on the `.critic-anchor-reveal` mark.
+   */
+  private planConsumedAnchorSegments(unit: RevealUnit, segments: Segment[]): void {
+    const mark = segments.length
+    segments.push(
+      { from: unit.from, to: unit.from + 1, cls: 'critic-mark' },
+      { from: unit.to - 1, to: unit.to, cls: 'critic-mark' },
     )
     for (let i = mark; i < segments.length; i++) {
       const s = segments[i]
