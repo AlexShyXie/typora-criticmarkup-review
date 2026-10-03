@@ -1,0 +1,28 @@
+{
+  "private": true,
+  "name": "criticmarkup-review-for-typora-community-plugin",
+  "version": "0.1.0",
+  "description": "CriticMarkup review (additions, deletions, highlights, substitutions, threaded comments) for Typora with a right-dock panel.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.js --prod",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "pack": "npm run build && node pack.js"
+  },
+  "devDependencies": {
+    "@types/jquery": "^3.5.32",
+    "@types/node": "^22.20.4",
+    "@types/typora": "npm:@typora-community-plugin/typora-types@^1.0.16",
+    "@typora-community-plugin/core": "2.10.21",
+    "@typora-community-plugin/typora-types": "^1.0.16",
+    "archiver": "^7.0.1",
+    "esbuild": "0.28.2",
+    "esbuild-plugin-typora": "npm:@typora-community-plugin/esbuild-plugin-typora@^1.0.12",
+    "esbuild-sass-plugin": "3.7.0",
+    "sass": "^1.105.0",
+    "typescript": "^5.9.3",
+    "vitest": "4.1.11"
+  }
+}

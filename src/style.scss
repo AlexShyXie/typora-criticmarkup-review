@@ -1,0 +1,613 @@
+/* CriticMarkup Review — editor inline rendering + right-dock panel. */
+
+/* ================= inline rendering inside #write / preview ================= */
+
+.critic-mark {
+  display: none;
+}
+
+.critic-hidden {
+  display: none;
+}
+
+.critic-addition {
+  background: rgba(67, 181, 129, 0.18);
+  border-bottom: 1.5px solid rgba(67, 181, 129, 0.65);
+  color: inherit;
+}
+
+.critic-deletion,
+.critic-subst-old {
+  text-decoration: line-through;
+  text-decoration-color: rgba(225, 87, 76, 0.8);
+  background: rgba(225, 87, 76, 0.12);
+  color: rgba(120, 120, 120, 0.9);
+}
+
+.critic-subst-new {
+  background: rgba(67, 181, 129, 0.18);
+  border-bottom: 1.5px solid rgba(67, 181, 129, 0.65);
+}
+
+.critic-highlight,
+.critic-anchor {
+  background: rgba(250, 205, 70, 0.38);
+  border-bottom: 1.5px solid rgba(214, 164, 14, 0.6);
+}
+
+/* Comment chip: raw text hidden (font-size: 0), badge drawn by ::before.
+   Raw text stays in the DOM for copy / write-back / unwrap-restore. */
+.critic-comment-chip {
+  display: inline-block;
+  font-size: 0;
+  line-height: 0;
+  padding: 3px 7px;
+  margin: 0 1px;
+  border-radius: 9px;
+  background: rgba(86, 156, 214, 0.14);
+  border: 1px solid rgba(86, 156, 214, 0.38);
+  cursor: pointer;
+  user-select: none;
+}
+
+.critic-comment-chip::before {
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.critic-chip-NOTE::before {
+  content: '💬 note';
+  color: #3f87c5;
+}
+
+.critic-chip-ASK::before {
+  content: '❓ ask';
+  color: #b58900;
+}
+
+.critic-chip-EDIT::before {
+  content: '✏️ edit';
+  color: #cf4c40;
+}
+
+.critic-chip-PRAISE::before {
+  content: '👍 praise';
+  color: #2e9c66;
+}
+
+.critic-chip-REPLY::before {
+  content: '↩ reply';
+  color: #8a6fc0;
+}
+
+/* ========= caret-inside raw reveal: pure CSS class toggle =========
+   All tokens stay wrapped in BOTH modes; the caret token's segments get
+   .is-raw. The DOM structure (and thus every text node, and thus the
+   caret) is identical in raw and rendered modes. Class-only decoration,
+   same technique as typora-plugin-callout. */
+[data-critic-raw-key].is-raw {
+  font-size: inherit !important;
+  line-height: inherit !important;
+  display: inline !important;
+  background: transparent !important;
+  border: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  text-decoration: none !important;
+  color: inherit !important;
+  opacity: 1 !important;
+  cursor: auto !important;
+  vertical-align: baseline !important;
+  user-select: text !important;
+}
+
+[data-critic-raw-key].is-raw.critic-comment-chip::before,
+[data-critic-raw-key].is-raw .critic-comment-chip::before {
+  content: none;
+}
+
+/* Anchored `{==..==}` anchors are consumed by Typora's own highlight
+   parser on reload (`==text==` is native syntax) — the `==` never exists
+   in the DOM and our parser can no longer pair it with the comment. The
+   consumed element gets .critic-anchor-consumed (marked by the renderer):
+   rendered state shows OUR egg-yellow for consistency. */
+.critic-anchor-consumed {
+  background: rgba(250, 205, 70, 0.38) !important;
+  cursor: text;
+}
+
+/* v0.3.0: reveal is per-ELEMENT now (the old block-level .critic-has-raw
+   wrongly synthesized `==` whenever ANY token in the block revealed).
+   Revealing the consumed anchor shows the complete `{==text==}`: the mark
+   goes transparent and BOTH `==` are synthesized as generated content —
+   zero DOM changes, so Typora's parser cannot loop on it. */
+.critic-anchor-consumed.critic-anchor-reveal {
+  background: transparent !important;
+}
+
+.critic-anchor-consumed.critic-anchor-reveal::before,
+.critic-anchor-consumed.critic-anchor-reveal::after {
+  content: '==';
+  color: inherit;
+}
+
+/* v0.3.0: consumed substitution — Typora ate the `~~` of `{~~old~>new~~}`
+   into a native <del>. The del's own line-through (and any theme graying)
+   is disabled; the old span draws its own red line, the `~>` join hides,
+   the new text renders green WITHOUT strike-through. Revealing the unit
+   synthesizes `~~` on both sides and unfolds the join via .is-raw. */
+.critic-consumed-del {
+  text-decoration: none !important;
+  color: inherit;
+}
+
+.critic-subst-join {
+  font-size: 0;
+  line-height: 0;
+}
+
+.critic-consumed-del.critic-subst-reveal::before,
+.critic-consumed-del.critic-subst-reveal::after {
+  content: '~~';
+  color: inherit;
+}
+
+/* Toolbar rows: keep both spans equally wide. */
+.critic-toolbar-actions,
+.critic-toolbar-modes {
+  width: 100%;
+}
+
+/* ============================== modal ============================== */
+
+.critic-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.critic-modal-card {
+  width: min(420px, 80vw);
+  background: var(--bg-color, #fff);
+  color: var(--text-color, #222);
+  border-radius: 10px;
+  padding: 14px 16px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
+}
+
+.critic-modal-title {
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.critic-modal-input {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--side-bar-border-color, #ccc);
+  border-radius: 6px;
+  background: var(--bg-color, #fff);
+  color: var(--text-color, #222);
+}
+
+textarea.critic-modal-input {
+  min-height: 88px;
+  resize: vertical;
+}
+
+.critic-modal-hint {
+  font-size: 11px;
+  opacity: 0.55;
+  margin: 6px 0 10px;
+}
+
+.critic-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* ============================== right-dock panel ============================= */
+
+/* Core 2.10.21 gives split children flex sizing, but not side-dock tabs:
+   without this correction the dock keeps a fixed-width tab and the rest of
+   the pane is blank when the user widens the dock. (:has scopes the fix to
+   a tab group that actually hosts our view — same technique as tpov.) */
+.typ-workspace-sidedock > .sidedock-content > .typ-workspace-tabs:has(.critic-review-view) {
+  box-sizing: border-box;
+  flex: 1 1 0px;
+  min-width: 0px;
+  max-width: 100%;
+  min-height: 0;
+}
+
+.typ-workspace-sidedock .typ-workspace-tab-content:has(> .typ-workspace-leaf > .critic-review-view),
+.typ-workspace-sidedock .typ-workspace-leaf:has(> .critic-review-view) {
+  min-width: 0;
+  min-height: 0;
+}
+
+.critic-review-view {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  height: 100%;
+  overflow-y: auto;
+  padding: 10px 12px 24px;
+  font-size: 13px;
+  color: var(--text-color, #222);
+}
+
+.critic-review-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* ---- toolbar ---- */
+
+.critic-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--side-bar-border-color, #e4e4e4);
+}
+
+.critic-toolbar-modes,
+.critic-toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* ---- buttons ---- */
+
+.critic-btn {
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--side-bar-border-color, #ccc);
+  background: var(--bg-color, #fff);
+  color: var(--text-color, #222);
+  cursor: pointer;
+}
+
+.critic-btn:hover {
+  border-color: #3f87c5;
+  color: #3f87c5;
+}
+
+.critic-btn-quick {
+  min-width: 30px;
+  text-align: center;
+  font-weight: 600;
+}
+
+.critic-btn-toggle {
+  color: #8a6fc0;
+  border-color: rgba(138, 111, 192, 0.5);
+}
+
+.critic-btn-toggle.is-on {
+  background: rgba(138, 111, 192, 0.14);
+}
+
+.critic-btn-accept {
+  color: #2e9c66;
+  border-color: rgba(46, 156, 102, 0.5);
+}
+
+.critic-btn-accept:hover {
+  color: #2e9c66;
+}
+
+.critic-btn-reject {
+  color: #cf4c40;
+  border-color: rgba(207, 76, 64, 0.5);
+}
+
+.critic-btn-reject:hover {
+  color: #cf4c40;
+}
+
+.critic-btn-resolve {
+  color: #3f87c5;
+  border-color: rgba(63, 135, 197, 0.5);
+}
+
+.critic-btn-resolve:hover {
+  color: #3f87c5;
+}
+
+.critic-btn-edit,
+.critic-btn-reply {
+  color: inherit;
+}
+
+.critic-btn-tag {
+  font-size: 11px;
+  padding: 2px 8px;
+}
+
+.critic-btn-tag.is-active {
+  border-color: #3f87c5;
+  color: #3f87c5;
+  background: rgba(63, 135, 197, 0.1);
+}
+
+/* ---- sections ---- */
+
+.critic-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.critic-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.55;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.critic-empty {
+  font-size: 12px;
+  opacity: 0.45;
+  padding: 4px 2px;
+}
+
+/* ---- cards (shared by changes & comments) ---- */
+
+.critic-card {
+  border: 1px solid var(--side-bar-border-color, #e4e4e4);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--bg-color, transparent);
+  transition: border-color 0.15s ease;
+}
+
+.critic-card.is-flash {
+  border-color: #3f87c5;
+  box-shadow: 0 0 0 2px rgba(63, 135, 197, 0.25);
+}
+
+.critic-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.critic-card-meta {
+  font-size: 12px;
+  opacity: 0.6;
+}
+
+.critic-card-body {
+  margin-top: 6px;
+}
+
+.critic-card-ops {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* change cards: colored left rail per change type */
+.critic-change {
+  border-left: 3px solid #b0b7c0;
+}
+
+.critic-change-addition {
+  border-left-color: #43b581;
+}
+
+.critic-change-deletion {
+  border-left-color: #e1574c;
+}
+
+.critic-change-substitution {
+  border-left-color: #d6a40e;
+}
+
+.critic-change-preview {
+  margin-top: 6px;
+  font-size: 12.5px;
+  word-break: break-word;
+}
+
+.critic-change-preview .critic-preview-old {
+  text-decoration: line-through;
+  text-decoration-color: rgba(225, 87, 76, 0.8);
+  color: rgba(120, 120, 120, 0.9);
+}
+
+.critic-change-preview .critic-preview-new {
+  background: rgba(67, 181, 129, 0.16);
+  border-bottom: 1.5px solid rgba(67, 181, 129, 0.6);
+}
+
+.critic-change-preview .critic-preview-plain {
+  color: inherit;
+}
+
+/* comment cards: blue left rail */
+.critic-comment-card {
+  border-left: 3px solid #3f87c5;
+}
+
+/* ---- badges ---- */
+
+.critic-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.05);
+  flex-shrink: 0;
+}
+
+.critic-badge-addition {
+  color: #2e9c66;
+  background: rgba(46, 156, 102, 0.12);
+}
+
+.critic-badge-deletion {
+  color: #cf4c40;
+  background: rgba(207, 76, 64, 0.12);
+}
+
+.critic-badge-substitution {
+  color: #a07d00;
+  background: rgba(214, 164, 14, 0.14);
+}
+
+.critic-badge-tag-ask {
+  color: #b58900;
+  background: rgba(181, 137, 0, 0.12);
+}
+
+.critic-badge-tag-edit {
+  color: #cf4c40;
+  background: rgba(207, 76, 64, 0.12);
+}
+
+.critic-badge-tag-praise {
+  color: #2e9c66;
+  background: rgba(46, 156, 102, 0.12);
+}
+
+.critic-badge-tag-note {
+  color: #3f87c5;
+  background: rgba(63, 135, 197, 0.12);
+}
+
+.critic-badge-tag-reply {
+  color: #8a6fc0;
+  background: rgba(138, 111, 192, 0.12);
+}
+
+/* ---- comment bodies ---- */
+
+.critic-comment-body {
+  margin: 6px 0;
+  word-break: break-word;
+  white-space: pre-wrap;
+  cursor: text;
+}
+
+.critic-comment-empty {
+  font-style: italic;
+  opacity: 0.5;
+}
+
+.critic-comment-anchor {
+  font-size: 12px;
+  opacity: 0.6;
+  font-style: italic;
+  margin-bottom: 4px;
+  word-break: break-word;
+}
+
+.critic-reply {
+  border-top: 1px dashed var(--side-bar-border-color, #e0e0e0);
+  padding-top: 6px;
+  margin-top: 6px;
+}
+
+.critic-reply-head {
+  font-size: 12px;
+  opacity: 0.6;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.critic-reply-head:hover {
+  opacity: 1;
+  color: #3f87c5;
+}
+
+.critic-reply-body {
+  font-size: 12.5px;
+  word-break: break-word;
+  white-space: pre-wrap;
+  margin-top: 2px;
+  cursor: pointer;
+}
+
+.critic-reply-body:hover {
+  text-decoration: underline;
+  text-decoration-color: rgba(63, 135, 197, 0.5);
+}
+
+/* ---- inline editor / reply box ---- */
+
+.critic-editor-box,
+.critic-editor-box.critic-reply-box {
+  margin-top: 8px;
+}
+
+.critic-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 72px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12.5px;
+  border: 1px solid var(--side-bar-border-color, #ccc);
+  border-radius: 6px;
+  background: var(--bg-color, #fff);
+  color: var(--text-color, #222);
+  resize: vertical;
+}
+
+.critic-editor-box textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 72px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12.5px;
+  border: 1px solid var(--side-bar-border-color, #ccc);
+  border-radius: 6px;
+  background: var(--bg-color, #fff);
+  color: var(--text-color, #222);
+  resize: vertical;
+}
+
+.critic-tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.critic-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.critic-editor-hint {
+  font-size: 11px;
+  opacity: 0.5;
+  margin-top: 4px;
+}

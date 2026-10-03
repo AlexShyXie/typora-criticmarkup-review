@@ -1,0 +1,81 @@
+# CriticMarkup Review — typora-community-plugin
+
+CriticMarkup 修订与批注插件：在 Typora 里标记增/删/改/高亮，写下带类型和作者的评论线程，并在右侧栏的统一面板里审阅、跳转、接受/拒绝全部更改。面向 typora-community-plugin（v2.10.21+）开发，命令全部注册进 F1 命令面板。
+
+功能对标 [obsidian-review-critics](https://github.com/rohrbachd/obsidian-review-critics)（解析器结构自其移植，MIT），评论格式设计参考 [obsidian-review-comments](https://github.com/shotashirai1719/obsidian-review-comments) 的懒 ID 线程方案（实现全部独立重写，未使用其任何代码）。
+
+## 语法（CriticMarkup）
+
+| 标记 | 含义 | 渲染 |
+|---|---|---|
+| `{++新增++}` | 添加 | 绿色下划线 |
+| `{--删除--}` | 删除 | 红色删除线 |
+| `{~~旧~>新~~}` | 替换 | 红删绿增 |
+| `{==高亮==}` | 高亮 | 黄色底纹 |
+| `{>>评论<<}` | 评论 | 蓝色小徽章 |
+
+## 评论格式（懒 ID 线程）
+
+```markdown
+这句话有{==问题==}{>>Hui|NOTE: 论证不足<<}，需要重写。
+
+# 加回复时自动升级为线程（补 id + 日期，同 id 串联）
+这句话有{==问题==}{>>rc-a1b2c3|Hui|2026-10-02|NOTE: 论证不足<<}{>>rc-a1b2c3|Claude|2026-10-03|REPLY: 已重写<<}
+```
+
+- `作者|TYPE: 正文` 为最小格式；TYPE ∈ ASK / EDIT / PRAISE / NOTE（回复固定 REPLY）
+- 兼容旧格式 `{>>[author=Hui] body<<}`
+- 正文内的 `|`、换行自动转义（`\|`、`\n`），多行评论保持单行存储
+- 普通评论零额外噪声；只有出现回复时才写入 `rc-xxxxxx` 线程 id 与日期
+
+## F1 命令（12 条）
+
+- Mark Selection as Addition / Deletion / Highlight / Substitution
+- Comment on Selection（选区锚定评论，写入后右侧栏自动聚焦编辑框）
+- Accept / Reject Change at Cursor
+- Accept All Changes、Copy Clean Text（复制全部接受后的干净文本）
+- Toggle Accepted View（按“全部接受”渲染，不改动文件）
+- Toggle Review Panel、Refresh Review Panel
+
+## 右侧栏面板
+
+- Quick Actions 工具条：+ / − / ▮ / ⇄ / 💬 与 Accepted View、Accept All
+- Changes 区：每条修订显示类型徽章、内容、所属章节，点击跳转，Accept/Reject 单条处理
+- Comments 区：线程卡片（作者 · 行号 · 类型 · 正文 · 锚点引文），内联 Edit/Reply/Resolve；点击任一回复行可直接编辑该条回复
+  - 面板内直接编辑评论正文与类型；文档若已变化则拒绝写回（防错位）
+  - 编辑中的卡片不会被编辑器刷新打断
+- 编辑区评论徽章点击 → 打开面板并高亮对应卡片
+
+## 渲染行为
+
+- 增/删/改/高亮/评论在所见即所得中渲染为样式（标记语法隐藏）
+- **按单元显示源码**（与 Typora 对 `**粗体**` 的行为一致，粒度到每个单元）：点/光标落在锚点区只显示 `{==锚文本==}`（Typora 重载消费掉 `==` 后由 CSS 合成补全）；点 ASK 徽章只显示 ASK 自己的源码；点 REPLY 徽章只显示 REPLY 的源码；替换标记显示旧词删除线 + 新词高亮（原生 `<del>` 消费已被接管）。光标移开自动恢复渲染
+- 清除/接受/拒绝按光标所在单元精确作用：锚点区只清 `{==…==}`、单条评论只删自己
+- 面板写回（Edit/Reply/Resolve/Accept）后立即重渲染并驻留光标，不会闪现源码
+
+## 评论线程格式（懒 ID）
+
+- 单条评论保持干净、无 ID：`{>>Hui|2026-10-03|NOTE: 正文<<}`
+- 一旦产生回复，线程升级为共享 ID 绑定：`{>>rc-xxxxxx|Hui|2026-10-03|NOTE: 正文<<}{>>rc-xxxxxx|Hui|2026-10-03|REPLY: 回复<<}`
+- ID 仅用于把后续回复绑定到首条评论（否则两个相邻评论无法区分是"同一线程"还是"两条独立评论"）；渲染视图中完全不可见
+- Resolve 保留锚定文本、移除整个线程
+
+## 已知边界
+
+- 源码模式（Ctrl+/）显示原始标记——与 Obsidian source mode 行为一致
+- 选区跨粗体/斜体等行内标记时，包裹标记会作用于选区纯文本；含行内格式语法的锚定评论暂不能从面板 Resolve（DOM 文本与 markdown 源不一致）
+- Track Changes 自动修订（打字自动生成标记）未实现（评估为高风险项，独立攻坚）
+
+## 开发
+
+```bash
+npm install
+npm run test        # vitest（56 用例）
+npm run typecheck   # tsc --noEmit
+npm run build       # esbuild -> dist/main.js + dist/main.css
+npm run pack        # 打包 criticmarkup-review.zip
+```
+
+## 许可
+
+MIT。解析器结构移植自 obsidian-review-critics（MIT，Daniel Rohrbach），见 LICENSE.md。
