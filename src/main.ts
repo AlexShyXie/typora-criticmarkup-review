@@ -204,7 +204,10 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
         if (this.placement.isVisible()) this.refreshReviewPanel(0)
       }, 400)
     }, 'global')
-    cmd('debug-dump-block', 'Debug: Dump Block DOM at Cursor', () => this.dumpBlockDom(), 'global')
+    // v0.4.6: "Debug: Dump Block DOM at Cursor" was removed from the palette.
+    // The plumbing it used (`dumpBlockDom()` below and
+    // `CriticProcessor.debugDump()`) is deliberately kept — re-registering this
+    // one line brings the diagnostic back whenever it is needed again.
     cmd('refresh-review', 'Refresh Review Panel', () => this.refreshReviewPanel(0), 'global')
   }
 

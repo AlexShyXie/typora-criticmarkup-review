@@ -35,10 +35,11 @@ This sentence has a {==problem==}{>>rc-a1b2c3|Hui|2026-10-02|NOTE: needs an argu
 - `|` and newlines inside the body are escaped automatically (`\|`, `\n`), so multi-line comments stay on one source line
 - Plain comments carry zero extra noise; a `rc-xxxxxx` thread id and dates are written only once a reply exists
 
-## F1 commands (12)
+## F1 commands (13)
 
 - Mark Selection as Addition / Deletion / Highlight / Substitution
 - Comment on Selection (anchors the comment to the selection; the right-dock editor box gets focus right after the write)
+- Strip CriticMarkup Markup at Cursor (removes the markup at the caret, keeping the text)
 - Accept / Reject Change at Cursor
 - Accept All Changes, Copy Clean Text (copies the document as if everything were accepted)
 - Toggle Accepted View (renders as "all accepted" without touching the file)
@@ -73,11 +74,9 @@ This sentence has a {==problem==}{>>rc-a1b2c3|Hui|2026-10-02|NOTE: needs an argu
 
 ## Known limits
 
-- Source mode (Ctrl+/) shows the raw markup — same behaviour as Obsidian's source mode
-- When a selection spans inline markup such as bold/italic, the wrapper is applied to the selection's plain text; an anchored comment containing inline syntax cannot be Resolved from the panel yet (DOM text and markdown source disagree)
 - Track Changes (auto-marking while typing) is not implemented (assessed as high-risk, tracked separately)
 
-Download [Boundary_Test](CriticMarkup_Multiline_Boundary_Test.md) to know the boundary.
+Download [Boundary_Test](Multiline_Boundary_Test.md) to know the boundary.
 
 ## Installation
 ### Prerequisites

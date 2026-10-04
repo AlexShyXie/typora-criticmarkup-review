@@ -9,7 +9,7 @@ release notes. A tag without a matching section fails the build.
 
 ## Unreleased
 
-## 0.4.5
+## 0.4.6
 
 ### fix replace panel bug
 

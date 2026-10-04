@@ -30,10 +30,11 @@ CriticMarkup 修订与批注插件：在 Typora 里标记增/删/改/高亮，�
 - 正文内的 `|`、换行自动转义（`\|`、`\n`），多行评论保持单行存储
 - 普通评论零额外噪声；只有出现回复时才写入 `rc-xxxxxx` 线程 id 与日期
 
-## F1 命令（12 条）
+## F1 命令（13 条）
 
 - Mark Selection as Addition / Deletion / Highlight / Substitution
 - Comment on Selection（选区锚定评论，写入后右侧栏自动聚焦编辑框）
+- Strip CriticMarkup Markup at Cursor（去掉光标处的 CriticMarkup 标记，保留正文）
 - Accept / Reject Change at Cursor
 - Accept All Changes、Copy Clean Text（复制全部接受后的干净文本）
 - Toggle Accepted View（按“全部接受”渲染，不改动文件）
@@ -57,7 +58,7 @@ CriticMarkup 修订与批注插件：在 Typora 里标记增/删/改/高亮，�
 - 增/删/改/高亮/评论在所见即所得中渲染为样式（标记语法隐藏）
 - **按单元显示源码**（与 Typora 对 `**粗体**` 的行为一致，粒度到每个单元）：点/光标落在锚点区只显示 `{==锚文本==}`（`==`/`~~` 实为 Typora 的 `.md-meta` 隐藏跨度，reveal 时由样式强制显示，完整源码可见）；点 ASK 徽章只显示 ASK 自己的源码；点 REPLY 徽章只显示 REPLY 的源码；替换标记显示旧词红色删除线 + 新词绿色高亮（原生 `<del>` 删除线已被接管，不再波及新词）。光标移开自动恢复渲染；在单元内打字零重包裹（输入法安全）
 - 清除/接受/拒绝按光标所在单元精确作用：锚点区只清 `{==…==}`、单条评论只删自己
-- 面板写回（Edit/Reply/Resolve/Accept）后立即重渲染并驻留光标，不会闪现源码
+- 面板写回（Edit/Reply/Resolve/Accept）后立即重渲染并驻留光标
 
 ## 评论线程格式（懒 ID）
 
@@ -68,11 +69,9 @@ CriticMarkup 修订与批注插件：在 Typora 里标记增/删/改/高亮，�
 
 ## 已知边界
 
-- 源码模式（Ctrl+/）显示原始标记——与 Obsidian source mode 行为一致
-- 选区跨粗体/斜体等行内标记时，包裹标记会作用于选区纯文本；含行内格式语法的锚定评论暂不能从面板 Resolve（DOM 文本与 markdown 源不一致）
 - Track Changes 自动修订（打字自动生成标记）未实现（评估为高风险项，独立攻坚）
 
-下载 [Boundary_Test](CriticMarkup_Multiline_Boundary_Test.md) 来了解插件渲染边界情况.
+下载 [Boundary_Test](Multiline_Boundary_Test.md) 来了解插件渲染边界情况.
 
 ## 安装
 
