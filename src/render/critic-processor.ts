@@ -166,6 +166,15 @@ const QUIET_MS = 250
 const CONFIRM_MS = 120
 
 /**
+ * v0.4.3.2: a CROSS-BLOCK leave needs no quiescence and no second read, but a
+ * clear landing in the very frame Typora just rewrote the line is still the
+ * "chip frame" v0.4.2/v0.4.3 removed. A render suspected within this grace
+ * period defers the leave to the bounded sweep (which then clears it ~150ms
+ * later, deterministically — no mutations follow a click-away).
+ */
+const LEAVE_RENDER_GRACE = 120
+
+/**
  * v0.4.3: when a repair must guess which unit was revealed and neither the
  * remembered offset nor the remembered ordinal hits, accept a unit whose
  * range is within this many characters of the remembered caret offset.
@@ -717,8 +726,16 @@ export class CriticRenderService {
       this.processCaretBlock(caret.block, caret.offset, caret.anchorEl, true)
       if (this.readReveal(caret.block) === before) stale = true
     }
-    if (stale && ++this.recheckAttempts < 5) {
-      this.recheckTimer = window.setTimeout(() => this.runRevealRecheck(), CONFIRM_MS + 30)
+    if (stale) {
+      if (++this.recheckAttempts < 5) {
+        this.recheckTimer = window.setTimeout(() => this.runRevealRecheck(), CONFIRM_MS + 30)
+      } else {
+        // v0.4.3.2: never give up SILENTLY. A stale reveal the sweep stopped
+        // chasing then lingered until an unrelated event swept it, which is
+        // why the leftover source view looked random. It is now visible in
+        // the `TRACE:` line of the debug dump.
+        this.traceDecision(this.lastRevealOrdinal, 'giveup')
+      }
     }
   }
 
@@ -946,12 +963,27 @@ export class CriticRenderService {
     }
     const prev = this.lastCaretBlock
     if (prev && prev.isConnected && containerEl.contains(prev)) {
-      // v0.4.3: moving to another block IS a deliberate leave — but only
-      // when the gate agrees. A bogus read landing in another block while
-      // Typora rebuilds the line must not end the reveal (that was one of
-      // the "chip frame" sources); the recheck sweep then cleans it up.
-      if (allowClear && this.clearGate() === 'ok') this.clearReveal(prev)
-      else if (allowClear) this.scheduleRevealRecheck()
+      // v0.4.3.2: moving to another block IS the leave, and a TRUSTED read
+      // in another block cannot be Typora's artefact — its re-renders only
+      // collapse the selection INSIDE the line being rebuilt, and that
+      // offset-0 case is already filtered by `isCaretTrustworthy`. Waiting
+      // on `clearGate` here (250ms quiescence + 120ms confirmation, both
+      // endlessly renewed by the typing that preceded the click, plus a
+      // recheck sweep that gave up after 5 attempts) is what left the block
+      // in source view for 150–800ms or forever — the "it re-renders
+      // sometimes, I can't find the trigger" report.
+      //
+      // The gate keeps guarding the SAME-BLOCK case (see `commitReveal`),
+      // which is where every edit-driven bogus read lives; that is the
+      // anti-flash guarantee of v0.4.2/v0.4.3 and it is untouched here.
+      // The only thing still checked: a render suspected within
+      // LEAVE_RENDER_GRACE defers the leave to the bounded sweep instead of
+      // clearing inside Typora's own rewrite frame.
+      if (allowClear && Date.now() - this.renderSuspectedAt >= LEAVE_RENDER_GRACE) {
+        this.clearReveal(prev)
+      } else if (allowClear) {
+        this.scheduleRevealRecheck()
+      }
       this.processBlock(prev)
     }
     this.processCaretBlock(caret.block, caret.offset, caret.anchorEl, allowClear)

@@ -59,6 +59,15 @@ const TAG_LABEL: Record<CriticTypeTag, string> = {
   ASK: '❓ ASK', EDIT: '✏️ EDIT', PRAISE: '👍 PRAISE', NOTE: '💬 NOTE', REPLY: '↩ REPLY',
 }
 
+/**
+ * v0.4.3.2: a reply row's single click jumps to the anchor, but the jump is
+ * deferred by this grace period so a DOUBLE-click (which still opens the
+ * inline editor) can cancel it. `navigate()` rebuilds the whole panel DOM, so
+ * navigating on the first click would detach the row before the dblclick
+ * could ever land on it — the editor would never open again.
+ */
+const REPLY_NAV_DELAY = 220
+
 export class ReviewView extends WorkspaceView implements ReviewViewActions {
 
   static type = REVIEW_VIEW_TYPE
@@ -453,10 +462,26 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
           )?.focus()
         }
         const openEdit = (e: MouseEvent) => open(e)
-        rHead.title = 'Double-click to edit'
-        rBody.title = 'Double-click to edit'
-        rHead.ondblclick = openEdit
-        rBody.ondblclick = openEdit
+        // v0.4.3.2: single click on a reply row NAVIGATES (same thread, same
+        // anchor as the comment head — clicking a comment jumps, a reply
+        // belongs to that very comment). Deferred + cancellable so the
+        // double-click-to-edit gesture keeps working (see REPLY_NAV_DELAY).
+        let navTimer: number | undefined
+        const scheduleNav = () => {
+          window.clearTimeout(navTimer)
+          navTimer = window.setTimeout(() => navigate(), REPLY_NAV_DELAY)
+        }
+        const cancelNav = () => window.clearTimeout(navTimer)
+        const openEditNow = (e: MouseEvent) => {
+          cancelNav()
+          openEdit(e)
+        }
+        rHead.title = 'Click to jump · double-click to edit'
+        rBody.title = 'Click to jump · double-click to edit'
+        rHead.onclick = scheduleNav
+        rBody.onclick = scheduleNav
+        rHead.ondblclick = openEditNow
+        rBody.ondblclick = openEditNow
         r.append(rHead, rBody)
       }
       body.append(r)

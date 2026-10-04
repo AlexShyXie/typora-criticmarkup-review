@@ -24,6 +24,13 @@ v0.4.2 之后整行不再闪，但**输入 / IME 上屏 / 删除时，光标所�
 - **CSS 加固带**：`style.scss` 用 `@for 0..24` 生成 `[data-critic-reveal="N"] [data-critic-unit="N"]` 的源码态规则（与 `.is-raw` 共用 `@mixin critic-raw-body`）。即便存在没想到的 JS 路径忘了投影，也不会出现"wrapper 已建、源码态未上"的帧 —— 投影于是从竞态降级为优化。
 - **诊断**：`debugDump()` 增 `revealAttr / lastRevealOrdinal / suppressed / gate / TRACE`（最近 12 条决策）。健康编辑会话：`kept` 连续增长、`suppressed` > 0、`cleared` 不因打字增长、`revealAttr` 始终等于 `lastRevealOrdinal`。
 
+### v0.4.3.2 "离开标记后不渲染"与"点 reply 不跳转"（第十三轮补丁）
+
+1. **跨块离开被门控卡住**：v0.4.3 把"清除"统一交给 `clearGate()`（quiet 250ms + confirm 120ms + 用户交互），但**跨块移动本身就是用户离开的确证**——Typora 的重渲染只会把选区塌缩在**同一块**内（offset-0 伪读已被 `isCaretTrustworthy` 滤掉），不可能把可信光标搬到另一个块。于是：打字后 `renderSuspectedAt` 被 mutation guard 不断续期 → quiet 永远不满足 → 走 recheck（每 150ms 一轮、**5 次后静默放弃**）→ 残留源码态直到某个无关事件来扫，表现正是"不立即渲染、有时又突然渲染、找不到触发模式"。
+   修法：跨块 + trusted 时**直接 `clearReveal(prev)` 立即渲染**；仅保留一条"渲染刚发生（≤ `LEAVE_RENDER_GRACE=120ms`）就交给重扫"的兜底，避免在 Typora 重写那一帧里清除（那才是 chip 闪烁的来源）。**同块内移出 unit 的清除完全不变**，v0.4.2/v0.4.3 的防闪语义不回退。recheck 放弃时写 `TRACE: …giveup`，不再静默。
+2. **右栏 reply 行没有导航绑定**：comment 卡片只有 `head.onclick = navigate`；reply 的 `critic-reply-head`/`critic-reply-body` 只绑了 dblclick 编辑。补上单击导航（reply 与首条评论同 entry，`navigateComment` 用 `thread.first` 的 key 天然正确，controller 无需改）。
+   **坑**：`navigate()` 会 `render()` 重建整个面板 DOM，单击即导航会让被点的行在 dblclick 到达前就被移除 → 双击编辑永久失效。所以 reply 的导航延迟 `REPLY_NAV_DELAY=220ms`，且 dblclick 会 `clearTimeout` 取消它。
+
 ### v0.4.3.1 两个"新机制自己踩自己"的坑（第十二轮补丁）
 
 1. **wrapper schema 版本**：v0.4.3 给 span 加了 `data-critic-unit`，但 `data-critic-sig` 只看文本 ⇒ 旧构建包出来的 span（无该属性）在每次 pass 都命中快速路径，**永远不会被重建**，`applyReveal` 找不到任何 `[data-critic-unit]` ⇒ 升级后 reveal 根本投影不上去（表现：打字时该 unit 恒为渲染态）。修法：签名前缀 `WRAP_SCHEMA='v3'`，wrapper 携带的属性集一变就 bump（代价：升级后每块多一次 rewrap）。**诊断要点**：dump 里 `unitSpans` 必须为 revealed 段数，为 0 即命中此坑。
