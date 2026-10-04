@@ -3,4 +3,5 @@
 node_modules/
 out/
 test/
+dist/
 plugin.zip

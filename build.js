@@ -20,4 +20,6 @@ await esbuild.build({
   ],
 })
 
-console.log('build done -> dist/main.js, dist/style.css')
+// dist/main.css is the raw sass output; `pack.js` renames it to style.css
+// (and adds manifest.json) when composing the 3-file plugin package.
+console.log('build done -> dist/main.js, dist/main.css')
