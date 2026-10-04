@@ -1,6 +1,6 @@
-# CriticMarkup Review
+# Typora CriticMarkup Review
 
-English | [简体中文](https://github.com/AlexShyXie/typora-criticmarkup-review/blob/main/README.zh.md)
+English | [简体中文](https://github.com/AlexShyXie/typora-criticmarkup-review/blob/main/README.zh.md) | 
 
 A CriticMarkup revision & review plugin for Typora: mark additions / deletions / substitutions / highlights, write typed, authored comment threads, and review, jump and accept/reject every change from a single right-dock panel. Built for [typora-community-plugin](https://github.com/typora-community-plugin/typora-community-plugin) (v2.10.21+); every command is registered in the F1 command palette.
 
@@ -77,29 +77,23 @@ This sentence has a {==problem==}{>>rc-a1b2c3|Hui|2026-10-02|NOTE: needs an argu
 - When a selection spans inline markup such as bold/italic, the wrapper is applied to the selection's plain text; an anchored comment containing inline syntax cannot be Resolved from the panel yet (DOM text and markdown source disagree)
 - Track Changes (auto-marking while typing) is not implemented (assessed as high-risk, tracked separately)
 
-## Development
+Download [Boundary_Test](CriticMarkup_Multiline_Boundary_Test.md) to know the boundary.
 
-```bash
-npm install
-npm run test        # vitest (35 cases)
-npm run typecheck   # tsc --noEmit
-npm run build       # esbuild -> dist/main.js + dist/main.css
-npm run pack        # build + package into out/ (versioned + latest) + ./plugin.zip
-npm run deliver     # same, then copy out/latest into the local Typora plugins folder
-```
+## Installation
+### Prerequisites
+Install and enable the Typora Community Plugin Framework
+Project address: https://github.com/typora-community-plugin/typora-community-plugin
+### Method 1: Plugin Marketplace (Recommended)
+Open Typora → Go to the Preferences of typora-community-plugin → **Plugin Marketplace**, search for `criticmarkup-review`, and install **and enable** it.
 
-Packaging output (`out/` is git-ignored):
+### Method 2: Manual Installation
+1. Download the latest `plugin.zip` from [Releases](https://github.com/AlexShyXie/typora-criticmarkup-review/releases) and unzip it.
+2. Place the unzipped files into the `criticmarkup-reviewr` folder, copy to:
+   - Global: `C:\Users\<You>\.typora\community-plugins\plugins\criticmarkup-review\`
+   - Or only for the current notebook library: `<Notebook Library>\.typora\plugins\criticmarkup-review\`
+3. Open Typora → Go to the Preferences of typora-community-plugin → **Installed Plugins** → Check `criticmarkup-review` to enable it.
 
-| Path | Contents |
-|---|---|
-| `plugin.zip` (repo root) | release asset — flat `main.js` + `style.css` + `manifest.json` |
-| `out/criticmarkup-review-<version>/` | main.js + style.css + manifest.json |
-| `out/criticmarkup-review-<version>.zip` | installable archive of that version (kept as history) |
-| `out/latest/`, `out/criticmarkup-review.zip` | always the current version |
-
-Pushing a numeric tag runs `.github/workflows/release.yml`: it installs dependencies, packs, and publishes `plugin.zip` as the release asset.
-
-The delivery folder can be overridden with `TYPORA_PLUGIN_DIR`; the default is `criticmarkup-review-delivery`.
+> Requires typora-community-plugin ≥ 2.8.2, Typora ≥ 1.5.0.
 
 ## License
 

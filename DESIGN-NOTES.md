@@ -257,6 +257,7 @@ v0.4.0 / v0.4.1 都还在闪 —— 本轮直接读 `D:\Program Files\Typora\res
 - vitest 43/43 全绿（critic-thread 17 + critic-core 9 + comment-caret-offset 9 + critic-resolve 8）；tsc --noEmit 零错误；esbuild 生产构建通过
 - 产物：`npm run pack` → out/criticmarkup-review-<version>/ + 同名 zip + out/latest/ + plugin.zip；`npm run deliver` 再拷进 `…\community-plugins\plugins\criticmarkup-review-delivery`（v0.4.6 已交付）
 - 构建必须用 `npm run build`（= `node build.js --prod`）才会 minify；直接 `node build.js` 出的是带 sourcemap 的开发包
+- v0.4.6 起 release notes 不再由 `git log` 拼：push tag 后 `.github/workflows/release.yml` 用 awk 从**该 tag 提交树里的** `CHANGELOG.md` 抽取 `## <tag>` 一节（双语 `###` 条目）直接当 `--notes-file`；缺文件 / 缺章节 / 空章节一律 `::error` + `exit 1`。发版流程：把 `## Unreleased` 改名为 `## <version>` → 提交 → 打同名 tag → push。历史 tag（0.3.0–0.4.4，树里没有 CHANGELOG.md）重跑该 workflow 会失败，属既定取舍（既往版本视为冻结）
 - v0.4.0 的两个问题（打字闪烁、锚点金黄）均已修复（根因见上）；**修复效果待用户实机复测**
 - 锚点若仍偏金黄：F1 跑 `Debug: Dump Block DOM at Cursor`，把剪贴板内容贴回来即可精确定位
 

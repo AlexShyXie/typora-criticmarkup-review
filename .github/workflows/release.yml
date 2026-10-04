@@ -47,19 +47,51 @@ jobs:
       - name: Pack plugin.zip
         run: npm run pack
 
+      # Release notes come from CHANGELOG.md, not from `git log`: the section
+      # under `## <version>` (bilingual `###` entries) is copied verbatim.
+      #
+      # The checkout `ref` is the tag itself, so this always reads the
+      # CHANGELOG.md of the version being released.
+      #
+      # Strict by design (matches the rule stated at the top of CHANGELOG.md):
+      # no file, no matching section, or an empty section -> fail the build.
+      # Known trade-off: the historical tags 0.3.0–0.4.4 were released from
+      # trees without a CHANGELOG.md, so re-running this workflow for them
+      # now fails. Past releases are considered frozen — do not re-run them.
       - name: Generate release body
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          tag="$TAG"
-          prev_tag=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || echo "")
-          if [ -n "$prev_tag" ]; then
-            echo "## What's Changed" > release_body.md
-            git log "$prev_tag..$tag" --oneline --no-decorate >> release_body.md
-          else
-            echo "## Initial release" > release_body.md
-            git log --oneline --no-decorate "$tag" >> release_body.md
+          set -euo pipefail
+          ver="$TAG"
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::error::CHANGELOG.md is missing. Release notes must come from it."
+            exit 1
           fi
+          # A section starts at the "## <ver>" heading (also accepts the
+          # "## [ver]" / "## vver" spellings) and ends at the next "## "
+          # heading or EOF. The version is compared as plain text, so the
+          # dots in "0.4.6" need no regex escaping; `\r` is stripped first
+          # because the file may carry CRLF line endings.
+          awk -v ver="$ver" '
+            { line = $0; sub(/\r$/, "", line) }
+            line ~ /^##[[:space:]]/ {
+              if (in_section) exit
+              v = line
+              sub(/^##[[:space:]]+/, "", v)
+              gsub(/[][]/, "", v)
+              sub(/^v/, "", v)
+              split(v, a, /[[:space:]]/)
+              if (a[1] == ver) in_section = 1
+              next
+            }
+            in_section { print line }
+          ' CHANGELOG.md | sed -e '/./,$!d' -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' > release_body.md
+          if [ ! -s release_body.md ]; then
+            echo "::error::CHANGELOG.md has no [$ver] section. Add '## $ver' with ### entries before tagging."
+            exit 1
+          fi
+          cat release_body.md
 
       - name: Create Release
         env:

@@ -1,4 +1,4 @@
-# CriticMarkup Review — typora-community-plugin
+# Typora CriticMarkup Review
 
 简体中文 | [English](https://github.com/AlexShyXie/typora-criticmarkup-review/blob/main/README.md)
 
@@ -72,29 +72,29 @@ CriticMarkup 修订与批注插件：在 Typora 里标记增/删/改/高亮，�
 - 选区跨粗体/斜体等行内标记时，包裹标记会作用于选区纯文本；含行内格式语法的锚定评论暂不能从面板 Resolve（DOM 文本与 markdown 源不一致）
 - Track Changes 自动修订（打字自动生成标记）未实现（评估为高风险项，独立攻坚）
 
-## 开发
+下载 [Boundary_Test](CriticMarkup_Multiline_Boundary_Test.md) 来了解插件渲染边界情况.
 
-```bash
-npm install
-npm run test        # vitest（35 用例）
-npm run typecheck   # tsc --noEmit
-npm run build       # esbuild -> dist/main.js + dist/main.css
-npm run pack        # 构建 + 打包到 out/（版本化 + latest），并在根目录生成 plugin.zip
-npm run deliver     # 同上，再把 out/latest 拷进本机 Typora 插件目录
-```
+## 安装
 
-推送数字 tag 会触发 `.github/workflows/release.yml`：装依赖 → 打包 → 把 `plugin.zip` 作为发布资产发布。
+### 依赖前提
+安装并启用 Typora Community Plugin Framework
+项目地址：https://github.com/typora-community-plugin/typora-community-plugin
 
-打包产物（out/ 与 plugin.zip 已 git-ignore）：
+### 方式一：插件市场（推荐）
 
-| 路径 | 内容 |
-|---|---|
-| `plugin.zip`（根目录） | 发布资产，扁平的 main.js + style.css + manifest.json |
-| `out/criticmarkup-review-<version>/` | main.js + style.css + manifest.json |
-| `out/criticmarkup-review-<version>.zip` | 该版本安装包（历史留档） |
-| `out/latest/`、`out/criticmarkup-review.zip` | 始终指向当前版本 |
+打开 Typora → 进入typora-community-plugin的偏好设置 → **插件市场**，搜索 `criticmarkup-review`，安装**并启用**。
 
-分发目标目录可用 `TYPORA_PLUGIN_DIR` 覆盖；默认 `criticmarkup-review-delivery`。
+### 方式二：手动安装
+
+1. 从 [Releases](https://github.com/AlexShyXie/typora-criticmarkup-review/releases) 下载最新的 `plugin.zip` 并解压
+2. 将解压出的文件放入 `criticmarkup-reviewr` 文件夹，复制到：
+   - 全局：`C:\Users\<你>\.typora\community-plugins\plugins\criticmarkup-review\`
+   - 或仅当前笔记库：`<笔记库>\.typora\plugins\criticmarkup-review\`
+3. 打开 Typora → 进入typora-community-plugin的偏好设置 → **已安装插件** → 勾选 `criticmarkup-review` 启用
+
+> 需要 typora-community-plugin ≥ 2.8.2、Typora ≥ 1.5.0。
+
+
 
 ## 许可
 
