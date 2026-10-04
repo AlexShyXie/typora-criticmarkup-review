@@ -168,6 +168,7 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
     cmd('copy-clean-text', 'Copy Clean Text (All Accepted)', () => this.copyCleanText())
     cmd('toggle-accepted-view', 'Toggle Accepted View', () => this.toggleAcceptedView())
     cmd('toggle-review-panel', 'Toggle Review Panel', () => this.placement.toggle(), 'global')
+    cmd('debug-dump-block', 'Debug: Dump Block DOM at Cursor', () => this.dumpBlockDom(), 'global')
     cmd('refresh-review', 'Refresh Review Panel', () => {
       this.renderService.process(editor.writingArea)
       this.controller.refreshPanel()
@@ -285,6 +286,20 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
       return
     }
     this.controller.stripToken(found.token, found.block)
+  }
+
+  /**
+   * v0.4.0: the anchor's "golden instead of egg-yellow" cannot be settled by
+   * reading Typora's bundled CSS alone — dump the live DOM of the caret block
+   * (text, native elements with class/inline/computed colours, outerHTML).
+   */
+  private dumpBlockDom(): void {
+    const info = this.renderService.debugDump()
+    console.log('[criticmarkup] block dump\n' + info)
+    navigator.clipboard?.writeText(info).then(
+      () => editor.EditHelper.showNotification('CriticMarkup: block DOM copied to clipboard'),
+      () => editor.EditHelper.showNotification('CriticMarkup: block DOM logged to console'),
+    )
   }
 
   private resolveAtCursor(accept: boolean): void {

@@ -305,18 +305,75 @@ export class CriticRenderService {
   private guardRoot: HTMLElement | null = null
   private composing = false
   private surgery = false
+
+  /**
+   * v0.4.0 — caret state kept for the guard.
+   *
+   * `lastCaretOffset` lets the guard keep a block in caret mode when the
+   * selection is momentarily unreadable (Typora detaches the caret's text
+   * node while it re-renders the line). Without it the guard fell through to
+   * `processBlock`, which clears `.is-raw` — that is the "flashes rendered,
+   * then back to source" symptom.
+   *
+   * `lastReveal*` is the last successfully applied reveal, used the same way.
+   * `dirtyBlocks` accumulates blocks Typora mutated WHILE an IME composition
+   * was running (surgery is forbidden then) so they can be repaired in the
+   * compositionend frame itself.
+   */
+  private lastCaretOffset = -1
+  private lastRevealKey: string | null = null
+  private lastRevealUnit: RevealUnit | null = null
+  private dirtyBlocks = new Set<HTMLElement>()
+
+  private rememberReveal(key: string | null, unit: RevealUnit | null): void {
+    this.lastRevealKey = key
+    this.lastRevealUnit = unit
+  }
+
   private readonly onCompositionStart = (): void => {
     this.composing = true
+    // v0.4.0: mark the caret block so the stylesheet can keep the line from
+    // flashing "rendered" while Typora re-renders it mid-composition (DOM
+    // surgery is forbidden during a composition).
+    this.lastCaretBlock?.classList.add('critic-composing')
   }
   private readonly onCompositionEnd = (): void => {
     this.composing = false
+    this.lastCaretBlock?.classList.remove('critic-composing')
     const root = this.guardRoot
-    if (!root) return
-    // The composition just committed text — re-evaluate the caret block on
-    // the next tick (the DOM settles after compositionend).
-    setTimeout(() => {
-      if (root.isConnected) this.handleCaretMove(root)
-    }, 0)
+    if (!root || !root.isConnected) return
+    // v0.4.0: repair SYNCHRONOUSLY in the compositionend frame. The old
+    // setTimeout(…, 0) is a macrotask, so the browser was free to paint the
+    // half-rebuilt (rendered-looking) line before we restored the source
+    // view — one flash per committed character.
+    const pending = Array.from(this.dirtyBlocks)
+    this.dirtyBlocks.clear()
+    const caret = this.findCaret(root)
+    const block = caret?.block ?? this.lastCaretBlock
+    if (pending.length > 0) {
+      this.surgery = true
+      try {
+        for (const b of pending) {
+          if (!b.isConnected || !root.contains(b)) continue
+          if (caret && b === caret.block) {
+            this.processCaretBlock(b, caret.offset, caret.anchorEl)
+          } else {
+            this.processBlock(b)
+          }
+        }
+      } finally {
+        this.surgery = false
+      }
+    }
+    // The caret block itself may not have produced mutations we recorded
+    // (Typora can rebuild it in place), so always re-evaluate it too.
+    if (block && block.isConnected && root.contains(block)) {
+      if (caret && block === caret.block) {
+        this.processCaretBlock(block, caret.offset, caret.anchorEl)
+      } else if (!pending.includes(block)) {
+        this.processBlock(block)
+      }
+    }
   }
 
   buildProcessor(): HtmlPostProcessor {
@@ -358,11 +415,14 @@ export class CriticRenderService {
       // block that was showing raw markup, if any.
       const prev = this.lastCaretBlock
       this.lastCaretBlock = null
+      this.lastCaretOffset = -1
+      this.rememberReveal(null, null)
       if (prev && prev.isConnected && containerEl.contains(prev)) {
         this.processBlock(prev)
       }
       return
     }
+    this.lastCaretOffset = caret.offset
     if (caret.block === this.lastCaretBlock) {
       // Same block — unit membership may still differ; re-evaluate.
       this.processCaretBlock(caret.block, caret.offset, caret.anchorEl)
@@ -375,12 +435,50 @@ export class CriticRenderService {
     this.processCaretBlock(caret.block, caret.offset, caret.anchorEl)
   }
 
+  /**
+   * v0.4.0 diagnostic: dump the caret block's text / DOM / computed colours.
+   * The anchor's golden-vs-egg-yellow question could not be settled by
+   * reading Typora's bundled CSS alone, so the real DOM is made one F1
+   * command away (copied to the clipboard + logged to the console).
+   */
+  debugDump(): string {
+    const root = this.guardRoot
+    if (!root) return '(no guard root attached)'
+    const caret = this.findCaret(root)
+    const block = caret?.block ?? this.lastCaretBlock
+    if (!block) return '(no caret block)'
+    const out: string[] = []
+    out.push(`caretOffset=${caret ? caret.offset : 'n/a'}  lastCaretOffset=${this.lastCaretOffset}`)
+    out.push(`revealKey=${JSON.stringify(this.lastRevealKey)}`)
+    out.push('TEXT: ' + JSON.stringify(block.textContent ?? ''))
+    block.querySelectorAll<HTMLElement>('mark, del, s, strike').forEach(el => {
+      const cs = window.getComputedStyle(el)
+      out.push([
+        `<${el.tagName.toLowerCase()}>`,
+        `class="${el.className}"`,
+        `inline="${el.getAttribute('style') ?? ''}"`,
+        `bg=${cs.backgroundColor}`,
+        `color=${cs.color}`,
+        `deco=${cs.textDecorationLine}`,
+      ].join(' '))
+    })
+    out.push('HTML: ' + (block.outerHTML ?? '').slice(0, 4000))
+    return out.join('\n')
+  }
+
   /** Force full reveal of raw markup (plugin unload, accepted-view toggle). */
   unwrapAll(containerEl: HTMLElement): void {
     containerEl.querySelectorAll<HTMLElement>(LEAF_BLOCK_SELECTOR).forEach(block => {
       this.unwrapBlock(block)
     })
+    // v0.4.0: our inline !important takeover out-ranks every stylesheet, so
+    // it must be undone explicitly or Typora's native highlight stays dead
+    // after the plugin unloads.
+    this.clearNeutralization(containerEl)
     this.lastCaretBlock = null
+    this.lastCaretOffset = -1
+    this.rememberReveal(null, null)
+    this.dirtyBlocks.clear()
   }
 
   // ------------------------------------------------------------- internals
@@ -442,42 +540,75 @@ export class CriticRenderService {
       root.removeEventListener('compositionstart', this.onCompositionStart, true)
       root.removeEventListener('compositionend', this.onCompositionEnd, true)
     }
+    this.lastCaretBlock?.classList.remove('critic-composing')
     this.guardRoot = null
     this.surgery = false
     this.composing = false
+    this.dirtyBlocks.clear()
   }
 
   dispose(): void {
     this.detachMutationGuard()
     this.lastCaretBlock = null
+    this.lastCaretOffset = -1
+    this.rememberReveal(null, null)
   }
 
   private onGuardMutations(records: MutationRecord[]): void {
     const root = this.guardRoot
     if (!root || !root.isConnected) return
-    // IME composition: never run DOM surgery mid-composition — swapping
-    // text nodes under the caret is what duplicated CJK input before.
-    if (this.composing || this.surgery) return
+    // IME composition and our own surgery never re-enter here (see below for
+    // the composition bookkeeping, which moved after block collection).
+    if (this.surgery) return
     if (this.acceptedView) return
 
     const blocks = new Set<HTMLElement>()
-    for (const record of records) {
-      const node = record.target
-      if (!node || !root.contains(node)) continue
+    const collect = (node: Node | null): void => {
+      if (!node) return
+      if (!root.contains(node)) return
       const el = node.nodeType === Node.TEXT_NODE
         ? node.parentElement
         : (node as HTMLElement)
       const block = el?.closest<HTMLElement>(LEAF_BLOCK_SELECTOR) ?? null
       if (block && root.contains(block)) blocks.add(block)
     }
+    for (const record of records) {
+      collect(record.target)
+      // v0.4.0: `record.target` is the PARENT of the change. When Typora
+      // swaps a whole leaf block (<p>) the target is #write, whose closest
+      // leaf is null — the block was never collected and the repair had to
+      // wait for the framework's ~400ms edit round-trip (a long flash).
+      record.addedNodes.forEach(collect)
+      record.removedNodes.forEach(collect)
+    }
     if (blocks.size === 0) return
+
+    // IME composition: never run DOM surgery mid-composition — swapping
+    // text nodes under the caret is what duplicated CJK input before.
+    // v0.4.0: remember the blocks instead of dropping them, so the repair
+    // happens in the compositionend frame (same frame, no painted flash).
+    if (this.composing) {
+      for (const block of blocks) this.dirtyBlocks.add(block)
+      return
+    }
 
     const caret = this.findCaret(root)
     this.surgery = true
     try {
       for (const block of blocks) {
-        if (block === caret?.block) {
+        if (caret && block === caret.block) {
           this.processCaretBlock(block, caret.offset, caret.anchorEl)
+        } else if (!caret && block === this.lastCaretBlock) {
+          // v0.4.0: the caret is momentarily unreadable (Typora detaches the
+          // caret's text node while re-rendering the line). Rendering this
+          // block as a normal one would CLEAR its .is-raw — the source view
+          // would blink off. Keep it in caret mode with the last known
+          // offset; if that resolves nothing, fall back to the remembered
+          // reveal key so the unit stays revealed.
+          this.processCaretBlock(block, this.lastCaretOffset, null)
+          if (this.lastRevealKey && !block.querySelector('[data-critic-raw-key].is-raw')) {
+            this.syncRawState(block, this.lastRevealKey, null)
+          }
         } else {
           this.processBlock(block)
         }
@@ -489,6 +620,7 @@ export class CriticRenderService {
 
   private processCaretBlock(block: HTMLElement, caretOffset: number, anchorEl: HTMLElement | null): void {
     this.lastCaretBlock = block
+    if (caretOffset >= 0) this.lastCaretOffset = caretOffset
     const text = block.textContent ?? ''
     const tokens = text.includes('{')
       ? parser.parseTokens(text, { mergeAnchored: false })
@@ -505,6 +637,7 @@ export class CriticRenderService {
     // Fast path A — caret stamp current (typing inside a unit): keep the
     // spans, only sync the reveal classes.
     if (block.dataset.criticCaret === caretSig && this.wrappersMatch(block, expectWraps)) {
+      this.rememberReveal(reveal.key, reveal.unit)
       this.syncRawState(block, reveal.key, reveal.unit)
       return
     }
@@ -513,6 +646,7 @@ export class CriticRenderService {
     // keystroke after a click would destroy the composition session.
     if (block.dataset.criticSig === textSig && this.wrappersMatch(block, expectWraps)) {
       block.dataset.criticCaret = caretSig
+      this.rememberReveal(reveal.key, reveal.unit)
       this.syncRawState(block, reveal.key, reveal.unit)
       return
     }
@@ -528,6 +662,11 @@ export class CriticRenderService {
     for (const unit of units) {
       if (unit.kind === 'consumed-subst') {
         this.planConsumedSubstSegments(unit, text, segments)
+      } else if (unit.kind === 'consumed-anchor') {
+        // v0.4.0: the caret block used to skip this, so a consumed anchor's
+        // literal `{` / `}` stayed visible next to the (native) mark while
+        // the caret sat anywhere in the block. processBlock already does it.
+        this.planConsumedAnchorSegments(unit, segments)
       }
     }
     if (segments.length > 0) {
@@ -539,10 +678,26 @@ export class CriticRenderService {
     block.dataset.criticSig = textSig
     block.dataset.criticCaret = caretSig
     this.restoreCaret(block, caretOffset)
-    // v0.3.2: the native mark/del hosting our spans is neutralized by CLASS
-    // (:has() alone proved unreliable) — recomputed after every wrap.
-    this.syncNativeHostClasses(block)
-    this.syncRawState(block, reveal.key, reveal.unit)
+    // v0.4.0: the native mark/del hosting our spans is neutralized by inline
+    // !important (CSS alone proved unreliable) — recomputed after every wrap.
+    this.neutralizeNativeHosts(block, units)
+
+    // v0.4.0 — THE typing-flash fix.
+    // `reveal` was resolved BEFORE the surgery, i.e. off the pre-surgery
+    // wrapper span, whose data-critic-raw-key is the raw markup WITHOUT the
+    // character the user just typed. The spans we just created carry the NEW
+    // key, so syncRawState(reveal.key) matched nothing and the frame painted
+    // the RENDERED view; the source view only came back on the next
+    // selectionchange (150ms debounce) — one flash per keystroke.
+    // Re-locate the caret in the POST-surgery DOM and resolve again: the
+    // anchor now sits inside a fresh wrapper carrying the new key (`findCaret`
+    // is read-only, so the caret itself is untouched).
+    const post = this.findCaret(block)
+    const revealAfter = post
+      ? this.resolveReveal(block, post.offset, post.anchorEl, units)
+      : { key: null, unit: null }
+    this.rememberReveal(revealAfter.key, revealAfter.unit)
+    this.syncRawState(block, revealAfter.key, revealAfter.unit)
   }
 
   /** The unit whose interior (margin-adjusted) contains the caret offset. */
@@ -599,26 +754,103 @@ export class CriticRenderService {
     })
     // Runs on every pass (fast paths included): Typora can drop the class
     // when it re-renders a block, and the golden mark would come back.
-    this.syncNativeHostClasses(block)
+    this.neutralizeNativeHosts(block, units)
   }
 
   /**
-   * v0.3.2: neutralize the native element that HOSTS our wrapper spans.
+   * v0.4.0: neutralize every native element that HOSTS our wrapper spans —
+   * by INLINE `!important`, which no external stylesheet rule can outrank.
    *
-   * The stylesheet rule `mark:has([data-critic-raw-key])` does the same job,
-   * but it silently does nothing if `:has()` is unavailable or its
-   * invalidation misses spans we insert dynamically — the symptom is
-   * Typora's `mark{background:#ff0}` golden shining through our highlight.
-   * A plain class is deterministic. Elements already owned by a consumed
-   * unit are skipped: their own class carries the egg-yellow `!important`
-   * background and must win.
+   * History: v0.3.1 relied on `mark:has([data-critic-raw-key])` and v0.3.2
+   * added the plain-class fallback `mark.critic-native-host`, both setting
+   * `background: transparent !important`. Typora's only golden source is
+   * `mark{background:#ff0}` (base.css, specificity 0-0-1, no !important), so
+   * both should have won — yet the anchor still rendered golden. Rather than
+   * keep guessing at the cascade, the takeover is now written straight onto
+   * the element's style attribute, where it is unconditionally authoritative.
+   *
+   * The takeover makes the host transparent (and drops the del's
+   * strike-through); the visual styling then comes exclusively from OUR
+   * spans — `.critic-highlight` egg-yellow for anchors, `.critic-subst-old`
+   * red line / `.critic-subst-new` green underline for substitutions.
+   *
+   * Hosts are found two ways, because neither alone is reliable across
+   * Typora's rebuilds:
+   *  (a) walking UP from every segment span we own (covers nesting variants a
+   *      single `querySelector` misses), and
+   *  (b) text-range overlap between a unit and the native element (catches
+   *      the shape where our span and the mark are siblings rather than
+   *      parent/child, which is what leaves the golden visible).
+   *
+   * Consumed units are deliberately left to the stylesheet
+   * (`.critic-anchor-consumed` egg-yellow / `.critic-consumed-del`): writing
+   * the background inline would out-rank `.critic-anchor-reveal`'s
+   * `background: transparent !important` and keep the highlight painted while
+   * the source is revealed.
+   *
+   * Every write is paired with a `removeProperty` (see `clearNativeHosts`) so
+   * `unwrapAll` / `dispose` restore Typora's native look exactly.
    */
-  private syncNativeHostClasses(block: HTMLElement): void {
-    block.querySelectorAll<HTMLElement>('mark, del, s, strike').forEach(el => {
+  private neutralizeNativeHosts(block: HTMLElement, units: RevealUnit[]): void {
+    const isNative = (el: HTMLElement): boolean => {
+      const tag = el.tagName
+      return tag === 'MARK' || tag === 'DEL' || tag === 'S' || tag === 'STRIKE'
+    }
+    const hosts = new Set<HTMLElement>()
+
+    // (a) ancestor walk from our own segments.
+    block.querySelectorAll<HTMLElement>('[data-critic-raw-key]').forEach(seg => {
+      for (let p = seg.parentElement; p && p !== block; p = p.parentElement) {
+        if (isNative(p)) hosts.add(p)
+      }
+    })
+
+    const natives = Array.from(block.querySelectorAll<HTMLElement>('mark, del, s, strike'))
+    // (b) text-range overlap with a unit.
+    if (units.length > 0) {
+      const ranges = natives.map(el => ({ el, range: textRangeOf(block, el) }))
+      for (const u of units) {
+        for (const { el, range } of ranges) {
+          if (!range) continue
+          if (range.from < u.to && range.to > u.from) hosts.add(el)
+        }
+      }
+    }
+
+    for (const el of natives) {
       const owned = el.classList.contains('critic-anchor-consumed')
         || el.classList.contains('critic-consumed-del')
-      const hosts = !owned && el.querySelector('[data-critic-raw-key]') !== null
-      el.classList.toggle('critic-native-host', hosts)
+      const host = hosts.has(el) && !owned
+      // Keep the class as a documented, CSS-only fallback path.
+      el.classList.toggle('critic-native-host', host)
+      if (!host) {
+        // Never touch a consumed unit or a mark we do not own.
+        if (!owned) this.clearNativeHost(el)
+        continue
+      }
+      el.style.setProperty('background-color', 'transparent', 'important')
+      el.style.setProperty('color', 'inherit', 'important')
+      if (el.tagName !== 'MARK') {
+        el.style.setProperty('text-decoration', 'none', 'important')
+      }
+    }
+  }
+
+  /** Undo everything `neutralizeNativeHosts` wrote on one element. */
+  private clearNativeHost(el: HTMLElement): void {
+    el.classList.remove('critic-native-host')
+    el.style.removeProperty('background-color')
+    el.style.removeProperty('color')
+    el.style.removeProperty('text-decoration')
+  }
+
+  /** Undo the takeover across a whole tree (plugin unload / re-render). */
+  clearNeutralization(root: HTMLElement): void {
+    root.querySelectorAll<HTMLElement>('mark, del, s, strike').forEach(el => {
+      if (el.classList.contains('critic-native-host')
+        || el.style.getPropertyValue('background-color')) {
+        this.clearNativeHost(el)
+      }
     })
   }
 
@@ -712,7 +944,7 @@ export class CriticRenderService {
         .forEach(seg => this.wrapSegment(block, seg))
     }
 
-    this.syncNativeHostClasses(block)
+    this.neutralizeNativeHosts(block, units)
     block.dataset.criticSig = textSig
     this.syncRawState(block, null, null)
   }

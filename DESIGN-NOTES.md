@@ -1,6 +1,23 @@
 # CriticMarkup Review for Typora — 设计决策速查
 
-> v0.3.1（2026-10-03 深夜第八轮）。所有决策均已用户拍板或由调研证实。
+> v0.4.0（2026-10-04 第九轮）。所有决策均已用户拍板或由调研证实。
+
+## v0.4.0 打字闪烁根因 + 锚点配色硬化（第九轮实测两问题）
+
+1. **打字每上屏一个字闪一下渲染态（问题1，主因已代码定位）**：根因是 `processCaretBlock` 的 reveal 求解**早于** DOM 手术。`resolveReveal` 规则1 取手术前 `anchorEl.closest('[data-critic-raw-key]')` → 得到**旧** raw key；而 `unwrapBlock + wrapSegment` 之后新建的 span 携带的是**含刚输入字符的新** raw key。`syncRawState(reveal.key)` 于是一个 span 都匹配不上 → 本帧无 `.is-raw` → 显示渲染态；要等 `selectionchange`（main.ts 150ms 防抖）重解才回源码态。触发条件"每键必重包裹"：Typora 每次输入都重排该行 inline DOM，wrapper 被销毁 → `wrappersMatch` 必失配 → 必走全量分支。修复：**reveal 解析下沉到手术之后**——`restoreCaret` 之后用 `findCaret(block)`（传 block 作容器，`closest` 含自身）取术后 `anchorEl/offset` 再 `resolveReveal`；快路径（无手术）保持原样（DOM 未变，术前术后等价）。
+2. **守卫时序三点加固（问题1 次因）**：
+   - `onCompositionEnd` 去掉 `setTimeout(…,0)`：宏任务可能落在一次 paint 之后 → 改为**同步**修复；组字期间被抑制的块记入 `dirtyBlocks`，在 compositionend 同帧 flush（手术仍只在组字外进行，IME 安全不变）。
+   - `onGuardMutations` 原来只看 `record.target`（=变更的父节点）：Typora 整块替换 `<p>` 时 target 是 `#write`，`closest(LEAF_BLOCK)` 为 null → 该块**永远漏修**，只能等框架 ~400ms 回环。改为同时扫描 `record.addedNodes/removedNodes`。
+   - 新增 `lastCaretOffset` / `lastRevealKey`：光标瞬时读不到（Typora 重排时摘掉光标的文本节点）时，脏块若 === `lastCaretBlock` 仍走 caret 模式，不再退化成"按普通块渲染 → 清掉 `.is-raw`"。
+3. **锚点金黄（问题2，改用 inline 强制接管）**：实测 Typora 1.14.10 / Electron 42.2.0（`:has()` 可用），`base.css` 唯一金黄来源 `mark{background:#ff0;color:#000}`（0-0-1、无 `!important`），`dist/main.css` 里 `mark:has([data-critic-raw-key])` 与 `mark.critic-native-host` 两条 transparent 规则都在，且替换标记的红/绿（同为 `:has()` 规则）正常 ⇒ 层叠链上仍有未覆盖环节，静态推演无法定论。修复：`syncNativeHostClasses` 升级为 **`neutralizeNativeHosts`，直接写 inline `!important`**（`background-color:transparent`、`color:inherit`、del 另加 `text-decoration:none`）——inline important 无法被任何外部样式表规则覆盖。宿主识别双路：(a) 从每个 `[data-critic-raw-key]` span **向上遍历祖先**收集 mark/del/s/strike（覆盖嵌套变体，`querySelector` 单层判定会漏）；(b) 单元与原生元素的**文本区间重叠**（覆盖 span 与 mark 是兄弟而非父子的形态）。消费态单元（`critic-anchor-consumed`/`critic-consumed-del`）**刻意不写 inline**：inline 会压过 `.critic-anchor-reveal{background:transparent!important}`，reveal 时底色去不掉；它们继续走样式表。
+4. **可逆性（硬约束）**：所有 inline 写入配 `removeProperty`；新增 `clearNeutralization(root)`，`unwrapAll`/`dispose`/`detachMutationGuard` 全部清理，保证插件卸载后 Typora 原生外观完整恢复。
+5. **组字期兜底样式**：`critic-composing` 打在光标块上（compositionstart 加 / compositionend 摘 / detach 兜底摘），CSS 仅中和 `mark/del/s/strike` 并显示它们的 `.md-meta`，防止组字期间 Typora 重排导致整段露出原生渲染；作用域只限 mark/del，不波及其它 markdown 语法。
+6. **诊断命令**：F1 `Debug: Dump Block DOM at Cursor` → 复制光标块 outerHTML + 原生元素的 class/inline/computed 颜色到剪贴板并 console.log。配色问题下一轮可直接拿真实 DOM 定论，不再靠静态推演。
+7. **顺带补齐**：`processCaretBlock` 原先漏了 `planConsumedAnchorSegments`（`processBlock` 有），导致消费态锚点的字面 `{`/`}` 在光标块里一直可见。
+
+**DOM 结构更正（推翻 v0.3.1 的描述）**：`resources/appsrc/window/frame.js` 里高亮的真实模板是
+`<span md-inline='highlight' class='md-pair-s'><span class='md-meta md-before'>==</span><mark>inner</mark><span class='md-meta md-after'>==</span></span>`
+—— `==` 是 mark 的**兄弟** md-meta span，**不是** mark 内部；`{`/`}` 在 md-pair-s 之外。即"mark 内含 md-meta"的说法有误，但 `textContent` 与偏移计算不受影响。
 
 ## v0.3.1 md-meta 真相模型（第八轮实测六问题，推翻"消费"理论）
 
@@ -100,8 +117,10 @@
 ## 交付状态
 
 - vitest 23/23 全绿（critic-thread 14 + critic-core 9）；tsc --noEmit 零错误；esbuild 生产构建通过
-- 产物：dist/main.js + dist/main.css + manifest.json → criticmarkup-review.zip
-- v0.1.0 的三个问题均已修复（根因见上）；**修复效果待用户实机复测**
+- 产物：dist/main.js + dist/main.css + manifest.json → criticmarkup-review.zip（v0.4.0）
+- 构建必须用 `npm run build`（= `node build.js --prod`）才会 minify；直接 `node build.js` 出的是带 sourcemap 的开发包
+- v0.4.0 的两个问题（打字闪烁、锚点金黄）均已修复（根因见上）；**修复效果待用户实机复测**
+- 锚点若仍偏金黄：F1 跑 `Debug: Dump Block DOM at Cursor`，把剪贴板内容贴回来即可精确定位
 
 ## 关键实现速查
 

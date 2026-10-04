@@ -222,6 +222,49 @@ strike.critic-native-host {
   color: inherit !important;
 }
 
+/* v0.4.0: the same neutralization, but for EVERY state — not only while
+   revealed. wrapSegment's extractContents clones the partially-covered
+   mark/del INTO our delimiter spans; a clone that keeps Typora's `#ff0`
+   paints golden straight into a rendered token. */
+[data-critic-raw-key] mark {
+  background: transparent !important;
+  color: inherit !important;
+}
+
+[data-critic-raw-key] del,
+[data-critic-raw-key] s,
+[data-critic-raw-key] strike {
+  text-decoration: none !important;
+  color: inherit !important;
+}
+
+/* v0.4.0: IME composition window.
+   Typora can re-render the line WHILE a composition is running, dropping our
+   wrapper spans; DOM surgery is forbidden then (it destroys the composition
+   session), so the native shape would stay on screen until compositionend.
+   These rules keep that window from looking "rendered". Deliberately scoped
+   to mark/del only — no other markdown syntax is touched. */
+.critic-composing mark {
+  background: transparent !important;
+  color: inherit !important;
+}
+
+.critic-composing del,
+.critic-composing s,
+.critic-composing strike {
+  text-decoration: none !important;
+  color: inherit !important;
+}
+
+.critic-composing mark .md-meta,
+.critic-composing del .md-meta,
+.critic-composing s .md-meta,
+.critic-composing strike .md-meta {
+  display: inline !important;
+  width: auto !important;
+  opacity: 1 !important;
+}
+
 /* Toolbar rows: keep both spans equally wide. */
 .critic-toolbar-actions,
 .critic-toolbar-modes {
