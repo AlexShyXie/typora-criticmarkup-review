@@ -5,6 +5,7 @@ import {
   findConsumedSubstitutionRanges,
 } from '../critic/consumed'
 import { SYNTAX } from '../critic/syntax'
+import { commentCaretOffset } from '../critic/comment-caret'
 import type {
   AdditionToken,
   CommentToken,
@@ -493,6 +494,19 @@ export class CriticRenderService {
   /** v0.4.3: ring buffer of reveal decisions, dumped by `debugDump()`. */
   private revealTrace: string[] = []
 
+  // ------------------------------------------------- v0.4.4 chip click focus
+
+  /** Root the pointer listeners are attached to (`#write`). */
+  private pointerRoot: HTMLElement | null = null
+  /**
+   * The chip hit by the last mousedown. Typora can rebuild the line between
+   * mousedown and click, so the element is paired with its nav key: the key
+   * survives a rewrap and is used to re-locate the chip (v0.4.4).
+   */
+  private pendingChip: { el: HTMLElement; navKey: string } | null = null
+  /** Plugin hook fired after a chip click parked the caret successfully. */
+  private chipFocusHook: ((navKey: string) => void) | null = null
+
   private rememberReveal(ordinal: number | null, unit: RevealUnit | null): void {
     this.lastRevealOrdinal = ordinal
     this.lastRevealUnit = unit
@@ -507,6 +521,141 @@ export class CriticRenderService {
   /** v0.4.2: did the user actually interact within `window` ms? */
   private hasRecentUserIntent(window = 400): boolean {
     return this.userIntentAt > 0 && Date.now() - this.userIntentAt < window
+  }
+
+  // ------------------------------------------- v0.4.4 chip click → caret
+
+  /**
+   * v0.4.4 — attach the "click a comment badge → park the caret inside it"
+   * listeners.
+   *
+   * WHY this exists: a chip is `font-size: 0` + `user-select: none`
+   * (style.scss), so a mouse click can never put the caret INSIDE it —
+   * Chromium drops it on the unit boundary (offset `from`, or the `}{` gap
+   * between two chips). `resolveReveal` then misses on BOTH rules (rule 1
+   * needs the anchor element inside `[data-critic-unit]`, rule 2 needs
+   * `offset >= from + margin` with `margin: 3`), so the source never
+   * reveals — which is why the user had to press Arrow-Right once, that
+   * keystroke being what finally moves the caret into the span.
+   *
+   * Sequence: `mousedown` records the chip (+ its nav key); `click` — i.e.
+   * AFTER the browser placed its own caret — re-parks it explicitly.
+   *
+   * @param onChipClick receives the chip's nav key, for the panel highlight.
+   */
+  attachPointerFocus(
+    root: HTMLElement,
+    onChipClick?: (navKey: string) => void,
+  ): void {
+    this.detachPointerFocus()
+    this.pointerRoot = root
+    this.chipFocusHook = onChipClick ?? null
+    root.addEventListener('mousedown', this.onChipPointerDown)
+    root.addEventListener('click', this.onChipClick)
+  }
+
+  /** Stop the pointer listeners (re-attach / plugin unload). */
+  detachPointerFocus(): void {
+    const root = this.pointerRoot
+    if (root) {
+      root.removeEventListener('mousedown', this.onChipPointerDown)
+      root.removeEventListener('click', this.onChipClick)
+    }
+    this.pointerRoot = null
+    this.chipFocusHook = null
+    this.pendingChip = null
+  }
+
+  /**
+   * Reveal the clicked chip's unit and park the caret at its BODY start.
+   *
+   * @returns the chip's nav key (for the panel), or null when it has none.
+   */
+  focusCommentChip(chipEl: HTMLElement): string | null {
+    const navKey = chipEl.dataset.criticNavKey ?? null
+    // Accepted view hides comments (`display: none`) — nothing to focus.
+    if (this.acceptedView) return navKey
+    const block = chipEl.closest<HTMLElement>(LEAF_BLOCK_SELECTOR)
+    if (!block) return navKey
+    const ordinal = Number(chipEl.dataset.criticUnit)
+    if (!Number.isInteger(ordinal)) return navKey
+
+    const text = block.textContent ?? ''
+    const tokens = text.includes('{')
+      ? parser.parseTokens(text, { mergeAnchored: false })
+      : []
+    const units = buildRevealUnits(block, text, tokens)
+    const unit = units.find(u => u.index === ordinal)
+    if (!unit) return navKey
+
+    const target = unit.from + commentCaretOffset(text.slice(unit.from, unit.to))
+    // REVEAL FIRST, then park the caret: `critic-raw-body` carries
+    // `user-select: text !important`, so the freshly unfolded raw text is
+    // selectable — parking into a still-`user-select: none` chip risks
+    // Chromium moving the caret straight back out to the boundary.
+    this.setReveal(block, unit.index, unit)
+    this.placeCaret(block, target)
+    this.markUserIntent()
+    // `allowClear: false` — a chip click is a reveal, never a re-evaluation;
+    // it must not enter `clearGate()` (v0.4.3 anti-flash semantics).
+    this.processCaretBlock(block, target, chipEl, false)
+    return navKey
+  }
+
+  private readonly onChipPointerDown = (e: MouseEvent): void => {
+    if (e.button !== 0) return
+    const chip = this.chipFromEvent(e)
+    this.pendingChip = chip
+      ? { el: chip, navKey: chip.dataset.criticNavKey ?? '' }
+      : null
+  }
+
+  private readonly onChipClick = (e: MouseEvent): void => {
+    const pending = this.pendingChip
+    this.pendingChip = null
+    if (!pending || this.acceptedView) return
+    // A drag that ended inside a chip selected text — never hijack it.
+    const sel = window.getSelection()
+    if (sel && !sel.isCollapsed) return
+    // Typora may have rebuilt the line between mousedown and click.
+    const live = pending.el.isConnected
+      ? pending.el
+      : this.findChipByNavKey(pending.navKey)
+    if (!live) return
+    // Already in source view: the raw text is visible and clickable now, so
+    // the browser's own caret placement is what the user wants (clicking in
+    // the middle of `{>>…<<}` must NOT snap back to the body start).
+    if (live.classList.contains('is-raw')) return
+    const navKey = this.focusCommentChip(live)
+    if (navKey) {
+      try {
+        this.chipFocusHook?.(navKey)
+      } catch { /* a panel hook must never break the editor */ }
+    }
+  }
+
+  /** The comment chip under the pointer (::before is never an event target). */
+  private chipFromEvent(e: MouseEvent): HTMLElement | null {
+    const target = e.target
+    const fromTarget = target instanceof Element
+      ? target.closest<HTMLElement>('[data-critic-comment="1"]')
+      : null
+    if (fromTarget) return fromTarget
+    const hit = document.elementFromPoint(e.clientX, e.clientY)
+    return hit instanceof Element
+      ? hit.closest<HTMLElement>('[data-critic-comment="1"]')
+      : null
+  }
+
+  /** Re-locate a chip by nav key after Typora rebuilt the line (v0.4.4). */
+  private findChipByNavKey(navKey: string): HTMLElement | null {
+    const root = this.pointerRoot
+    if (!root || !navKey) return null
+    const hits = root.querySelectorAll<HTMLElement>('[data-critic-nav-key]')
+    for (const el of hits) {
+      if (el.getAttribute('data-critic-nav-key') === navKey) return el
+    }
+    return null
   }
 
   /**
@@ -1131,6 +1280,8 @@ export class CriticRenderService {
   detachMutationGuard(): void {
     this.guardObserver?.disconnect()
     this.guardObserver = null
+    // v0.4.4: the chip-click listeners live on the same root.
+    this.detachPointerFocus()
     const root = this.guardRoot
     if (root) {
       root.removeEventListener('compositionstart', this.onCompositionStart, true)
@@ -1589,16 +1740,31 @@ export class CriticRenderService {
     // artefact of Typora's innerHTML rewrite would fling the caret to the
     // block start (Typora restores the real caret itself a moment later).
     if (!this.isCaretTrustworthy({ block, offset })) return
+    this.placeCaret(block, offset)
+  }
+
+  /**
+   * Collapse the selection at `offset` within `block` — unconditionally.
+   *
+   * v0.4.4: split out of `restoreCaret` so a chip click can park the caret
+   * at an offset it computed itself (the trust gate only guards the
+   * post-surgery restore, which replays an offset Typora may have invalidated).
+   */
+  private placeCaret(block: HTMLElement, offset: number): boolean {
+    if (offset < 0) return false
     const pos = this.findPosition(block, offset)
-    if (!pos) return
+    if (!pos) return false
     try {
       const r = document.createRange()
       r.setStart(pos.node, pos.offset)
       r.collapse(true)
       const sel = window.getSelection()
-      sel?.removeAllRanges()
-      sel?.addRange(r)
+      if (!sel) return false
+      sel.removeAllRanges()
+      sel.addRange(r)
+      return true
     } catch { /* best effort */ }
+    return false
   }
 
   private wrappersMatch(block: HTMLElement, expected: boolean): boolean {

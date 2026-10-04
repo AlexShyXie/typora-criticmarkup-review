@@ -9,7 +9,8 @@
     "test": "vitest",
     "test:run": "vitest run",
     "typecheck": "tsc --noEmit",
-    "pack": "npm run build && node pack.js"
+    "pack": "npm run build && node pack.js",
+    "deliver": "npm run build && node pack.js --deliver"
   },
   "devDependencies": {
     "@types/jquery": "^3.5.32",

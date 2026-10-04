@@ -177,12 +177,22 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
     }
   }
 
-  /** Flash a comment card (e.g. clicked chip in editor). */
+  /**
+   * Flash a comment card (e.g. clicked chip in editor).
+   *
+   * v0.4.4: the editor hands over the nav key of the chip that was clicked,
+   * and that chip may be a REPLY — whose raw is neither `thread.first.raw`
+   * nor the comment-only slice of it. The thread's full raw (first comment +
+   * every reply) is therefore matched as a third case, so clicking a reply
+   * badge highlights the card holding the whole thread.
+   */
   highlightByNavKey(navKey: string): void {
     const entry = this.data.comments.find(c => {
       const first = c.thread.first
       const commentOnly = first.raw.slice(first.anchored ? first.anchored.highlightRaw.length : 0)
-      return commentOnly === navKey || first.raw === navKey
+      return commentOnly === navKey
+        || first.raw === navKey
+        || c.thread.raw.includes(navKey)
     })
     if (!entry) return
     const card = this.containerEl.querySelector(`[data-entry-id="${CSS.escape(entry.id)}"]`)

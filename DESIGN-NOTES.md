@@ -1,6 +1,31 @@
 # CriticMarkup Review for Typora — 设计决策速查
 
-> v0.4.3（2026-10-04 第十二轮）。所有决策均已用户拍板或由调研证实。
+> v0.4.4（2026-10-04 第十四轮）。所有决策均已用户拍板或由调研证实。
+
+## v0.4.4 徽章点击定位：点 comment / reply 徽章光标进不去（第十四轮）
+
+现象（用户原话，源码 `纯批注{>>rc-h20vku|Hui|2026-10-03|NOTE: 好吧s吧<<}{>>rc-h20vku|Hui|2026-10-03|REPLY: 可以三小的吗<<}的`）：
+1. 单击 note 徽章**不显示源码**；双击却会选中徽章里的 `{`（选中即显示源码）。
+2. 单击 reply 徽章，光标停在 note 的 `}` 与 reply 的 `{` 之间，**要再按一次右方向键**才显示源码。
+3. 光标点在"注"字后面（徽章边界外）不显示源码 —— 用户认为可以理解。
+4. **增 / 删 / 改 / 高亮全都正常**，只有徽章不行。
+
+**取证（读现有代码）**：
+1. `style.scss` 的 `.critic-comment-chip` 是 `display:inline-block; font-size:0; line-height:0; user-select:none`，徽章图形由 `::before` 的 content 画出，raw 文本留在 DOM 里但**零宽且不可选**。
+2. 于是鼠标点击根本无法把光标放进该 span：Chromium 只能落在徽章**边界外**——点 note ⇒ offset = `unit.from`；点 reply ⇒ 落在两块之间的 `}{`（= `reply.from`）。与现象 1、2 完全吻合。
+3. `resolveReveal()` 两条规则全部落空：规则 1 要求光标锚点元素在 `[data-critic-unit]` 内（此刻在 span 外）；规则 2 `revealUnitForCaret()` 要求 `offset >= from + margin`，token 单元 `margin = 3` ⇒ 边界 offset 被排除。**按一次右方向键让光标进入 span 内的文本节点 ⇒ 规则 1 命中 ⇒ 显示源码**，正是"右移一下才会"。
+4. 其它标记的正文可见且可选，点击天然落在 span 内 ⇒ 规则 1 命中 ⇒ 正常（现象 4）。
+
+**为什么不放宽判定 / 改 CSS**：把 `margin` 降到 0 会让"光标紧贴标记外侧就展开源码"，破坏 Typora 原生"光标必须进入语法内部才显示"的语义；让 raw 文本占位可见则直接毁掉渲染态。唯一既不改视觉、又不放宽揭示判定的做法是**显式泊靠光标**。
+
+**v0.4.4 修法（用户拍板：光标停在评论正文开头，并高亮右栏卡片）**：
+1. `src/critic/comment-caret.ts`（新，DOM-free 纯函数，9 个单测）：`commentCaretOffset(raw)` 返回徽章 raw 内"正文开头"的相对偏移。三级规则：① 有类型标签（`|NOTE:` / `|REPLY:` …）⇒ 冒号 + 跳过空格；② 无标签但有元数据 ⇒ 最后一个元数据 `|` 之后（最多数 3 根 `|`，因此正文里的 `|` 不会被误当分隔符）；③ 纯文本评论 ⇒ `{>>` 之后。结果恒被夹在 `[open, close)` 内，不可能落在 `<<}` 上。
+2. `CriticRenderService.focusCommentChip(chipEl)`：取 leaf block → 读 `data-critic-unit` 序号 → 重建 units → 算落点 → **`setReveal()` 先投影 `.is-raw`**（`critic-raw-body` 带 `user-select:text !important`，先变源码态再放光标，规避 `user-select:none` 下选区被浏览器挪走）→ `placeCaret()` 精确泊靠 → `markUserIntent()` → `processCaretBlock(..., allowClear=false)` 同步簿记。返回 navKey 供面板高亮。
+3. `attachPointerFocus(root, onChipClick?)`：`mousedown` 记下命中的徽章元素 + `data-critic-nav-key`（`::before` 不是事件目标，故 `e.target.closest()` + `elementFromPoint` 兜底）；`click`（浏览器默认落位之后）才执行，并按 navKey 重查元素——Typora 可能在 down 与 click 之间重建该行。守卫：`e.button !== 0`、`acceptedView`、选区非折叠（拖拽框选）一律不劫持。卸载对称地挂在 `detachMutationGuard()`。
+4. `main.ts` 的 `attachGuard()` 挂载，回调 `placement.getView<ReviewView>()?.highlightByNavKey(navKey)`；面板未打开时静默跳过，不自动打开。
+5. `ReviewView.highlightByNavKey` 原只匹配 `thread.first`，点 REPLY 徽章传的是 reply 的 raw ⇒ 必然 miss；补第三条 `thread.raw.includes(navKey)`，reply 也能命中所属 thread 卡片。
+
+**不改的部分**：`margin` 仍是 3（现象 3 保持"光标必须进入标记"）、拖拽框选 / 双击 / IME / accepted view、`clearGate()` 与 v0.4.2/v0.4.3 的全部防闪语义（点击徽章走 `allowClear=false`，永不清除）。
 
 ## v0.4.3 残留闪烁（只有光标所在那一个标记闪）的真正根因：reveal 是"每帧重算的派生量"（第十二轮）
 
@@ -190,8 +215,8 @@ v0.4.0 / v0.4.1 都还在闪 —— 本轮直接读 `D:\Program Files\Typora\res
 
 ## 交付状态
 
-- vitest 23/23 全绿（critic-thread 14 + critic-core 9）；tsc --noEmit 零错误；esbuild 生产构建通过
-- 产物：dist/main.js + dist/main.css + manifest.json → criticmarkup-review.zip（v0.4.1）
+- vitest 32/32 全绿（critic-thread 14 + critic-core 9 + comment-caret-offset 9）；tsc --noEmit 零错误；esbuild 生产构建通过
+- 产物：`npm run pack` → out/criticmarkup-review-<version>/ + 同名 zip + out/latest/ + out/criticmarkup-review.zip；`npm run deliver` 再拷进 `…\community-plugins\plugins\criticmarkup-review-delivery`（v0.4.4 已交付）
 - 构建必须用 `npm run build`（= `node build.js --prod`）才会 minify；直接 `node build.js` 出的是带 sourcemap 的开发包
 - v0.4.0 的两个问题（打字闪烁、锚点金黄）均已修复（根因见上）；**修复效果待用户实机复测**
 - 锚点若仍偏金黄：F1 跑 `Debug: Dump Block DOM at Cursor`，把剪贴板内容贴回来即可精确定位
@@ -203,6 +228,7 @@ v0.4.0 / v0.4.1 都还在闪 —— 本轮直接读 `D:\Program Files\Typora\res
 - 单条 accept/reject/评论编辑：DOM 文本流扫描定位 raw 串 → rangy 选中 → pasteHandler 替换
 - 面板编辑豁免：controller.writeBackCounter > 0 期间 edit 事件不触发 refreshPanel（防打字被打断）
 - 空评论流：插入 → 面板 open → 550ms 后 refreshPanel + focusByNavKey 直接聚焦编辑框
+- v0.4.4 徽章点击：`commentCaretOffset(raw)` 算正文起点 → `focusCommentChip(el)`（先 `setReveal` 后 `placeCaret`）→ 回调 `highlightByNavKey` 闪卡片；监听挂在 `attachPointerFocus(#write)`
 - ReviewView 构造签名：(leaf, callbacks, settings?)——containerEl 自建于 section 元素
 - 'typora' 类型解析：npm 别名 `@types/typora@npm:@typora-community-plugin/typora-types`（与官方 example 同款）
 - 设置页：SettingTab 基类 addSettingTitle/addSetting + addText/addSelect/addCheckbox

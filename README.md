@@ -73,8 +73,19 @@ npm install
 npm run test        # vitest（56 用例）
 npm run typecheck   # tsc --noEmit
 npm run build       # esbuild -> dist/main.js + dist/main.css
-npm run pack        # 打包 criticmarkup-review.zip
+npm run pack        # 构建 + 打包到 out/（版本化 + latest），并刷新根目录 zip
+npm run deliver     # 同上，再把 out/latest 拷进本机 Typora 插件目录
 ```
+
+打包产物（out/ 已 git-ignore）：
+
+| 路径 | 内容 |
+|---|---|
+| `out/criticmarkup-review-<version>/` | main.js + style.css + manifest.json |
+| `out/criticmarkup-review-<version>.zip` | 该版本安装包（历史留档） |
+| `out/latest/`、`out/criticmarkup-review.zip` | 始终指向当前版本 |
+
+分发目标目录可用 `TYPORA_PLUGIN_DIR` 覆盖；默认 `criticmarkup-review-delivery`。
 
 ## 许可
 

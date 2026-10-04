@@ -50,6 +50,13 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
     // The guard repairs in the mutation microtask, i.e. before paint.
     const attachGuard = () => {
       this.renderService.attachMutationGuard(editor.writingArea)
+      // v0.4.4: clicking a comment / reply badge parks the caret at the
+      // comment's body start and reveals its source (the badge itself is
+      // zero-width + user-select:none, so the browser cannot do it), then
+      // flashes the matching card in the review panel.
+      this.renderService.attachPointerFocus(editor.writingArea, navKey => {
+        this.placement.getView<ReviewView>()?.highlightByNavKey(navKey)
+      })
       // v0.4.2: the authoritative repair hook (see attachCursorChangeHook).
       this.detachCursorChange?.()
       this.detachCursorChange = this.attachCursorChangeHook()
