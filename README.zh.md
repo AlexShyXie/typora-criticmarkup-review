@@ -93,7 +93,15 @@ CriticMarkup 修订与批注插件：在 Typora 里标记增/删/改/高亮，�
 
 > 需要 typora-community-plugin ≥ 2.8.2、Typora ≥ 1.5.0。
 
+## 和typora-plugin-chat协同
 
+Let ai modify md file: 
+
+![image-20261004211811926](./vx_images/image-20261004211811926.png)
+
+Finally, user accept or reject modificationi:
+
+![image-20261004211803211](./vx_images/image-20261004211803211.png)
 
 ## 许可
 

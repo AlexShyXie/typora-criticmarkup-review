@@ -94,6 +94,20 @@ Open Typora → Go to the Preferences of typora-community-plugin → **Plugin Ma
 
 > Requires typora-community-plugin ≥ 2.8.2, Typora ≥ 1.5.0.
 
+
+
+## Work together with typora-plugin-chat
+
+Let ai modify md file: 
+
+![image-20261004211811926](./vx_images/image-20261004211811926.png)
+
+Finally, user accept or reject modificationi:
+
+![image-20261004211803211](./vx_images/image-20261004211803211.png)
+
+
+
 ## License
 
 MIT. The parser structure is ported from obsidian-review-critics (MIT, Daniel Rohrbach) — see LICENSE.md.
