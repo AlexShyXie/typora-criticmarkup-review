@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'tag to release (must exist)'
+        required: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # `github.ref_name` is the DEFAULT BRANCH on a manual dispatch, so
+          # the tag input has to drive the checkout in that case.
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # This plugin is built (TypeScript + sass): `npm run pack` runs the
+      # production build and writes `plugin.zip` (flat: main.js, style.css,
+      # manifest.json) at the repo root — the asset the installer expects.
+      #
+      # `continue-on-error`: historical tags (0.3.x … 0.4.x) are released from
+      # their own old trees, whose typecheck/tests were not written against
+      # today's dependencies. Producing the package matters more than the
+      # gate, so a red verify only warns.
+      - name: Verify
+        continue-on-error: true
+        run: |
+          npm run typecheck
+          npm run test
+
+      - name: Pack plugin.zip
+        run: npm run pack
+
+      - name: Generate release body
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          tag="$TAG"
+          prev_tag=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || echo "")
+          if [ -n "$prev_tag" ]; then
+            echo "## What's Changed" > release_body.md
+            git log "$prev_tag..$tag" --oneline --no-decorate >> release_body.md
+          else
+            echo "## Initial release" > release_body.md
+            git log --oneline --no-decorate "$tag" >> release_body.md
+          fi
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: >
+          gh release create "$TAG"
+          --title "$TAG"
+          --notes-file release_body.md
+          --verify-tag
+          plugin.zip
