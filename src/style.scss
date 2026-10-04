@@ -600,7 +600,16 @@ textarea.critic-modal-input {
   border-left-color: #e1574c;
 }
 
+/* v0.4.6: `replace` ({~~old~>new~~}) reads BLUE instead of egg-yellow —
+   yellow now belongs to highlight, which is what the document paints with
+   `.critic-highlight` (rgba(250,205,70,.38)). Blue keeps replace distinct
+   from addition (green) and deletion (red). */
 .critic-change-substitution {
+  border-left-color: #3f87c5;
+}
+
+/* v0.4.6: standalone `{==..==}` entries now appear in the panel. */
+.critic-change-highlight {
   border-left-color: #d6a40e;
 }
 
@@ -623,6 +632,12 @@ textarea.critic-modal-input {
 
 .critic-change-preview .critic-preview-plain {
   color: inherit;
+}
+
+/* v0.4.6: highlight preview — same egg-yellow band the document uses. */
+.critic-change-preview .critic-preview-highlight {
+  background: rgba(250, 205, 70, 0.38);
+  border-bottom: 1.5px solid rgba(214, 164, 14, 0.6);
 }
 
 /* comment cards: blue left rail */
@@ -652,7 +667,15 @@ textarea.critic-modal-input {
   background: rgba(207, 76, 64, 0.12);
 }
 
+/* v0.4.6: same reason as the rail above — the badge is labelled `replace`
+   and wears the blue used by comment cards / the NOTE tag. */
 .critic-badge-substitution {
+  color: #2f6fb3;
+  background: rgba(63, 135, 197, 0.14);
+}
+
+/* v0.4.6: highlight takes over the egg-yellow the substitution used. */
+.critic-badge-highlight {
   color: #a07d00;
   background: rgba(214, 164, 14, 0.14);
 }
@@ -683,6 +706,21 @@ textarea.critic-modal-input {
 }
 
 /* ---- comment bodies ---- */
+
+/* v0.4.6: the `{==..==}` text an anchored comment refers to. Egg-yellow
+   band + thin rail so it reads as "quoted from the document", not as body
+   text; text stays selectable unlike the body (nothing to double-click). */
+.critic-comment-quote {
+  margin: 4px 0 6px;
+  padding: 2px 6px;
+  font-size: 12.5px;
+  word-break: break-word;
+  white-space: pre-wrap;
+  background: rgba(250, 205, 70, 0.28);
+  border-left: 2px solid rgba(214, 164, 14, 0.7);
+  border-radius: 0 3px 3px 0;
+  cursor: pointer;
+}
 
 .critic-comment-body {
   margin: 6px 0;

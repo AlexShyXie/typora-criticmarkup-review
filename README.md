@@ -48,6 +48,9 @@ This sentence has a {==problem==}{>>rc-a1b2c3|Hui|2026-10-02|NOTE: needs an argu
 
 - Quick Actions toolbar: + / − / ▮ / ⇄ / 💬 plus Accepted View and Accept All
 - Changes: one card per revision with type badge, content and owning section — click to jump, Accept/Reject per card
+  - Badges read `addition` / `deletion` / `replace` / `highlight` (v0.4.6: `{~~old~>new~~}` is labelled **replace**, blue; `{==..==}` is **highlight**, egg-yellow — the colour the document paints it with)
+  - A standalone `{==..==}` gets its own card (v0.4.6). Accept keeps the text and removes the markup; **Reject deletes the highlighted text** (standard CriticMarkup — note `Reject All` therefore drops every unanchored highlight). A highlight anchored to a `{>>…<<}` is not listed twice: it shows as the yellow quote row on its comment card
+  - An anchored comment card shows the `{==..==}` text it refers to in a yellow quote row above the body (v0.4.6); clicking the quote jumps to the anchored region in the document
 - Comments: thread cards (author · line · type · body), inline Edit/Reply/Resolve; double-click a comment body or any reply row to edit that entry (double-click since v0.3.1, to avoid accidental edits)
   - Comment body and type can be edited in place; a write-back is refused when the document has changed (prevents misplacement)
   - A card being edited is never interrupted by an editor refresh

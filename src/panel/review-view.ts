@@ -6,6 +6,7 @@ import {
 import type {
   ChangePanelEntry,
   CommentPanelEntry,
+  CriticTokenType,
   CriticTypeTag,
 } from '../critic/types'
 
@@ -63,6 +64,21 @@ const QUICK_ACTIONS: { type: QuickActionType; label: string; title: string }[] =
 
 const TAG_LABEL: Record<CriticTypeTag, string> = {
   ASK: '❓ ASK', EDIT: '✏️ EDIT', PRAISE: '👍 PRAISE', NOTE: '💬 NOTE', REPLY: '↩ REPLY',
+}
+
+/**
+ * v0.4.6: the badge reads the USER-FACING name, not the internal token type.
+ * `{~~old~>new~~}` is `substitution` in the parser/renderer but the panel
+ * calls it `replace` (matching the "Mark Selection as Replace" command);
+ * renaming the internal type would ripple through the parser, the
+ * renderer and every nav key, so the mapping stays display-only.
+ */
+const CHANGE_LABEL: Record<CriticTokenType, string> = {
+  addition: 'addition',
+  deletion: 'deletion',
+  substitution: 'replace',
+  highlight: 'highlight',
+  comment: 'comment',
 }
 
 /**
@@ -326,7 +342,7 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
 
     const badge = document.createElement('span')
     badge.className = `critic-badge critic-badge-${entry.token.type}`
-    badge.textContent = entry.token.type
+    badge.textContent = CHANGE_LABEL[entry.token.type] ?? entry.token.type
 
     const meta = document.createElement('span')
     meta.className = 'critic-card-meta'
@@ -354,6 +370,16 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
         newEl.className = 'critic-preview-new'
         newEl.textContent = (entry.token as any).newText
         preview.append(oldEl, arrow, newEl)
+        break
+      }
+      // v0.4.6: standalone `{==..==}` now shows up in the panel (it was
+      // filtered out before), previewed like the document renders it — a
+      // yellow band, no +/- prefix because nothing is added or removed.
+      case 'highlight': {
+        const textEl = document.createElement('span')
+        textEl.className = 'critic-preview-highlight'
+        textEl.textContent = (entry.token as any).text
+        preview.append(textEl)
         break
       }
     }
@@ -430,8 +456,18 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
 
     head.append(badge, meta)
 
+    // v0.4.6: a comment anchored to `{==..==}` used to hide WHAT it comments
+    // on — the highlight was swallowed into the thread (parser pairs the two
+    // and drops the standalone token), so the panel showed the comment text
+    // with no quote. Render the anchored text as a yellow quote row above
+    // the body; clicking it jumps to the anchored region in the document.
+    const quote = entry.thread.anchor?.text
+      ? this.renderAnchorQuote(entry.thread.anchor.text, () => navigate())
+      : null
+
     const body = document.createElement('div')
     body.className = 'critic-card-body'
+    if (quote) body.append(quote)
 
     if (this.editingKey === entry.id) {
       body.append(this.renderCommentEditor(entry))
@@ -541,6 +577,21 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
 
     card.append(head, body, ops)
     return card
+  }
+
+  /**
+   * v0.4.6: the `{==..==}` text a comment is anchored to, drawn with the
+   * same egg-yellow the document uses (`.critic-highlight`) so the panel and
+   * the editor agree on what "highlight" looks like. Single click jumps to
+   * the anchor; no editing gesture here (that stays on the comment body).
+   */
+  private renderAnchorQuote(text: string, onJump: () => void): HTMLElement {
+    const quote = document.createElement('div')
+    quote.className = 'critic-comment-quote'
+    quote.textContent = text
+    quote.title = 'Highlighted text this comment refers to · click to jump'
+    quote.onclick = onJump
+    return quote
   }
 
   private renderCommentEditor(entry: CommentPanelEntry): HTMLElement {

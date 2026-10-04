@@ -35,7 +35,19 @@ export function acceptToken(token: CriticToken): string {
   }
 }
 
-/** Reject a change: restore the old state of the text. */
+/**
+ * Reject a change: restore the old state of the text.
+ *
+ * v0.4.6: a standalone `{==..==}` now follows CriticMarkup's standard
+ * semantics — rejecting DROPS the highlighted text (`''`), while accepting
+ * keeps it and only removes the markup. Before this, accept and reject were
+ * the same operation on a highlight, which made the panel's two buttons a
+ * no-op pair. Note the knock-on: `rejectAll` now deletes every unanchored
+ * highlight in the document.
+ *
+ * A comment anchored to a highlight is the exception: reject keeps the
+ * anchored text, otherwise the comment would lose the words it refers to.
+ */
 export function rejectToken(token: CriticToken): string {
   switch (token.type) {
     case 'addition':
@@ -45,14 +57,13 @@ export function rejectToken(token: CriticToken): string {
     case 'substitution':
       return (token as SubstitutionToken).oldText
     case 'highlight':
-    case 'comment':
-      if (token.type === 'comment') {
-        const comment = token as CommentToken
-        return comment.anchored
-          ? comment.anchored.text
-          : ''
-      }
-      return (token as HighlightToken).text
+      return ''
+    case 'comment': {
+      const comment = token as CommentToken
+      return comment.anchored
+        ? comment.anchored.text
+        : ''
+    }
   }
 }
 

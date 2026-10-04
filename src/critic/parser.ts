@@ -129,8 +129,13 @@ export class CriticParser {
   buildChangeEntries(content: string): ChangePanelEntry[] {
     const tokens = this.parseTokens(content)
     return tokens
+      // v0.4.6: `highlight` in — a standalone `{==..==}` was invisible in
+      // the panel. Ones anchored to a `{>>..<<}` are already consumed by
+      // `buildAnchoredPairs` (they show up as the comment's quote row), so
+      // they never reach this list and cannot appear twice.
       .filter((t): t is TrackedChangeToken =>
-        t.type === 'addition' || t.type === 'deletion' || t.type === 'substitution')
+        t.type === 'addition' || t.type === 'deletion'
+        || t.type === 'substitution' || t.type === 'highlight')
       .map((token, index) => ({
         id: `${token.type}:${token.from}:${token.to}:${index}`,
         token,

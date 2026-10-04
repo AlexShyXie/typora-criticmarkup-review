@@ -1,6 +1,27 @@
 # CriticMarkup Review for Typora — 设计决策速查
 
-> v0.4.5（2026-10-04 第十五轮）。所有决策均已用户拍板或由调研证实。
+> v0.4.6（2026-10-04 第十六轮）。所有决策均已用户拍板或由调研证实。
+
+## v0.4.6 面板 replace 徽章 / highlight 入列 / Reject 语义（第十六轮）
+
+现象（用户原话）：
+1. 右侧栏徽章写着 `substitution`，想改成 `replace`，颜色不要绿色（选了蓝色 `#3f87c5`）。
+2. 右侧栏里**没有 highlight**；highlight 应该用现在 substitution 的蛋黄色。
+3. 追问：comment 前面的高亮到底有没有被锚定？面板 Comments 区**并没有显示**对应的高亮。
+
+**取证**：
+1. 徽章文案 = `entry.token.type`（`review-view.ts` 直接把内部类型当显示名）⇒ 显示 `substitution`。配色在 `style.scss`：`.critic-change-substitution` / `.critic-badge-substitution` 是蛋黄 `#d6a40e`。
+2. `parser.buildChangeEntries()` 的 filter 只有 `addition / deletion / substitution` ⇒ highlight 永远不进列表；`TrackedChangeToken` 也没包含 `HighlightToken`。
+3. 锚定**确实存在**：`buildAnchoredPairs()` 把紧邻的 `{==..==}` + `{>>..<<}` 配成一对，highlight token 被 consumed，信息挂到 `comment.anchored` → `CommentThread.anchor`。但 `renderCommentCard()` 只画徽章 / 作者·日期·行号 / 正文 / 回复，**`anchor` 从未被渲染**（只在 `commentNavKey` 里用于切前缀）⇒ 面板确实无处显示被引用的高亮。用户观察属实。
+
+**修法**：
+1. 显示层新增 `CHANGE_LABEL`（`substitution → 'replace'`），`badge.textContent` 查表；**内部 token 类型、CSS 类名一律不动**（parser / renderer / nav key 全依赖 `'substitution'`）。
+2. 配色：`substitution`（文案 replace）改蓝色 `#3f87c5` 系（与 comment 色条 / NOTE 徽章同色系，靠文案区分）；新增 `.critic-change-highlight` / `.critic-badge-highlight` 接管蛋黄 `#d6a40e`，与文档里 `.critic-highlight`（`rgba(250,205,70,.38)`）同色。
+3. `TrackedChangeToken` 加 `HighlightToken`；`buildChangeEntries` filter 加 `highlight`；preview switch 加 highlight 分支（黄底，无 +/- 前缀）。被锚定的高亮已被 consumed，**不会重复入列**。
+4. comment 卡片在正文前插入 `.critic-comment-quote`（`thread.anchor.text`，蛋黄底 + 细条），单击走现有 `navigate()` 跳转；不碰 `.critic-comment-body` 的 `user-select:none` 与双击编辑语义。
+5. `rejectToken` 的 highlight 由"返回 text"改为**返回 `''`**（标准 CriticMarkup：Reject 删除被高亮文字），`acceptToken` 不变；`comment` 分支的 `anchored` 仍返回 `anchored.text`（锚定文字必须保留，否则 comment 失去落点）。副作用已告知用户：**Reject All 现在会删除所有未锚定的高亮**。
+
+**不改的部分**：内部 token 类型名、`resolveComment`（走 comment 自己的替换路径）、`REPLY_NAV_DELAY` 与双击编辑。
 
 ## v0.4.5 面板打开空列表 + reply 行跳到首条 comment（第十五轮）
 
@@ -233,8 +254,8 @@ v0.4.0 / v0.4.1 都还在闪 —— 本轮直接读 `D:\Program Files\Typora\res
 
 ## 交付状态
 
-- vitest 35/35 全绿（critic-thread 17 + critic-core 9 + comment-caret-offset 9）；tsc --noEmit 零错误；esbuild 生产构建通过
-- 产物：`npm run pack` → out/criticmarkup-review-<version>/ + 同名 zip + out/latest/ + out/criticmarkup-review.zip；`npm run deliver` 再拷进 `…\community-plugins\plugins\criticmarkup-review-delivery`（v0.4.5 已交付）
+- vitest 43/43 全绿（critic-thread 17 + critic-core 9 + comment-caret-offset 9 + critic-resolve 8）；tsc --noEmit 零错误；esbuild 生产构建通过
+- 产物：`npm run pack` → out/criticmarkup-review-<version>/ + 同名 zip + out/latest/ + plugin.zip；`npm run deliver` 再拷进 `…\community-plugins\plugins\criticmarkup-review-delivery`（v0.4.6 已交付）
 - 构建必须用 `npm run build`（= `node build.js --prod`）才会 minify；直接 `node build.js` 出的是带 sourcemap 的开发包
 - v0.4.0 的两个问题（打字闪烁、锚点金黄）均已修复（根因见上）；**修复效果待用户实机复测**
 - 锚点若仍偏金黄：F1 跑 `Debug: Dump Block DOM at Cursor`，把剪贴板内容贴回来即可精确定位

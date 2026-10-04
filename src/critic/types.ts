@@ -81,10 +81,16 @@ export type CriticToken =
   | HighlightToken
   | CommentToken
 
+/**
+ * v0.4.6: `HighlightToken` joins the panel's change list. A highlight is not
+ * an edit, but the panel is the only place that lists "what is marked in
+ * this note", and `{==..==}` had no card at all before.
+ */
 export type TrackedChangeToken =
   | AdditionToken
   | DeletionToken
   | SubstitutionToken
+  | HighlightToken
 
 /** A resolved comment thread: first comment + its replies. */
 export interface CommentThread {
