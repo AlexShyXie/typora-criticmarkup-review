@@ -1,5 +1,33 @@
 /* CriticMarkup Review — editor inline rendering + right-dock panel. */
 
+/* v0.4.3: the "source view" look, shared by the `.is-raw` projection and by
+   the block-attribute ordinal safety net (see the @for loop below). */
+@mixin critic-raw-body {
+  font-size: inherit !important;
+  line-height: inherit !important;
+  display: inline !important;
+  background: transparent !important;
+  border: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  text-decoration: none !important;
+  color: inherit !important;
+  opacity: 1 !important;
+  cursor: auto !important;
+  vertical-align: baseline !important;
+  user-select: text !important;
+}
+
+/* v0.4.3: unfold Typora's hidden `==` / `~~` syntax spans inside a revealed
+   unit (`.md-meta{display:none}` in base-control.css). */
+@mixin critic-raw-meta {
+  display: inline !important;
+  width: auto !important;
+  opacity: 1 !important;
+  font-size: inherit !important;
+  line-height: inherit !important;
+}
+
 /* ================= inline rendering inside #write / preview ================= */
 
 .critic-mark {
@@ -88,19 +116,7 @@
    caret) is identical in raw and rendered modes. Class-only decoration,
    same technique as typora-plugin-callout. */
 [data-critic-raw-key].is-raw {
-  font-size: inherit !important;
-  line-height: inherit !important;
-  display: inline !important;
-  background: transparent !important;
-  border: 0 !important;
-  padding: 0 !important;
-  margin: 0 !important;
-  text-decoration: none !important;
-  color: inherit !important;
-  opacity: 1 !important;
-  cursor: auto !important;
-  vertical-align: baseline !important;
-  user-select: text !important;
+  @include critic-raw-body;
 }
 
 [data-critic-raw-key].is-raw.critic-comment-chip::before,
@@ -200,11 +216,7 @@ strike.critic-native-host {
    `~~` characters become visible inside the revealed delimiters — this is
    what finally makes `====` show up when the anchor is revealed. */
 [data-critic-raw-key].is-raw .md-meta {
-  display: inline !important;
-  width: auto !important;
-  opacity: 1 !important;
-  font-size: inherit !important;
-  line-height: inherit !important;
+  @include critic-raw-meta;
 }
 
 /* 3. wrapSegment's extractContents clones the partially-containing
@@ -263,6 +275,63 @@ strike.critic-native-host {
   display: inline !important;
   width: auto !important;
   opacity: 1 !important;
+}
+
+/* ============ v0.4.3 ordinal safety net for the reveal truth ============
+   The reveal is owned by `block[data-critic-reveal="<ordinal>"]` and every
+   unit's elements carry `data-critic-unit="<ordinal>"`. CSS cannot compare
+   two attribute values, so the pairing is enumerated (0..24 units per block
+   is far beyond any realistic paragraph).
+
+   Why this exists: the JS projection re-applies `.is-raw` at the end of
+   every pass, but if some pass we have not thought of rebuilds the wrappers
+   without projecting, those wrappers would paint one frame as a CHIP. With
+   these rules the block attribute alone is enough to keep the unit in source
+   view — the projection becomes an optimisation, not a race. */
+@for $i from 0 through 24 {
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"] {
+    @include critic-raw-body;
+  }
+
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"].critic-comment-chip::before,
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"] .critic-comment-chip::before {
+    content: none;
+  }
+
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"] .md-meta {
+    @include critic-raw-meta;
+  }
+
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"] mark {
+    background: transparent !important;
+    color: inherit !important;
+  }
+
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"] del,
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"] s,
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"] strike {
+    text-decoration: none !important;
+    color: inherit !important;
+  }
+
+  /* consumed anchor: the mark itself goes transparent and the `==` is
+     synthesized (Typora already ate the real ones). */
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"].critic-anchor-consumed {
+    background: transparent !important;
+  }
+
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"].critic-anchor-consumed::before,
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"].critic-anchor-consumed::after {
+    content: '==';
+    color: inherit;
+  }
+
+  /* consumed substitution: same, with `~~`. */
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"].critic-consumed-del::before,
+  [data-critic-reveal="#{$i}"] [data-critic-unit="#{$i}"].critic-consumed-del::after {
+    content: '~~';
+    color: inherit;
+  }
 }
 
 /* Toolbar rows: keep both spans equally wide. */

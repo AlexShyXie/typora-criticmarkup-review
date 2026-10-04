@@ -30,6 +30,8 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
   private renderService!: CriticRenderService
   private placement!: RightDockPlacement
   private refreshTimer: number | undefined
+  /** v0.4.2 disposer for the Typora `cursorChange` hook (see below). */
+  private detachCursorChange: (() => void) | null = null
 
   onload() {
     const settings = new PluginSettings<ReviewSettings>(this.app, this.manifest, { version: 1 })
@@ -46,9 +48,25 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
     // SPACE (dropping our wrapper spans) while the framework only re-runs
     // post-processors after ~400ms, which painted raw source for that long.
     // The guard repairs in the mutation microtask, i.e. before paint.
-    const attachGuard = () => this.renderService.attachMutationGuard(editor.writingArea)
+    const attachGuard = () => {
+      this.renderService.attachMutationGuard(editor.writingArea)
+      // v0.4.2: the authoritative repair hook (see attachCursorChangeHook).
+      this.detachCursorChange?.()
+      this.detachCursorChange = this.attachCursorChangeHook()
+    }
     if (editor.writingArea) attachGuard()
     else setTimeout(attachGuard, 300)
+    this.register(() => this.detachCursorChange?.())
+
+    // v0.4.2: only a deliberate click / keypress may END a reveal. Typora's
+    // own caret restoration (undo.exeCommand) and our DOM surgery also emit
+    // selectionchange, and those must never be read as "the user left".
+    const intentHandler = () => this.renderService.markUserIntent()
+    const intentEvents: Array<keyof DocumentEventMap> = ['mousedown', 'click', 'keyup']
+    intentEvents.forEach(type => document.addEventListener(type, intentHandler, true))
+    this.register(() => {
+      intentEvents.forEach(type => document.removeEventListener(type, intentHandler, true))
+    })
 
     // Editor / preview rendering through the framework post-processor.
     // NOTE: the framework itself re-runs our processor on every 'edit'
@@ -314,6 +332,61 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
   }
 
   // -------------------------------------------------------------- refresh
+
+  // ------------------------------------------------- typora render hook
+
+  /**
+   * v0.4.2 — hook the ONE moment when a rebuilt line is ready to paint.
+   *
+   * Typora's `brushQueue` runs every 200ms (and 10ms after an IME commit).
+   * Inside it the caret block is re-rendered by `E() -> m()`, which always
+   * replaces the block's innerHTML (our wrapper spans only exist on the
+   * current-DOM side of its comparison), and the caret is only restored
+   * afterwards by `undo.exeCommand(i)`. `brush.expand()` then runs and ends
+   * with `$(editor.sessionStr).trigger("cursorChange", styleBookmark)`.
+   *
+   * `cursorChange` is a jQuery custom event, so it never reaches a native
+   * listener — two transports, in order of preference:
+   *
+   *  1. jQuery: Typora assigns `window.$ = window.jQuery` globally
+   *     (`resources/appsrc/window/frame.js`, module "50").
+   *  2. Wrap `editor.brush.expand`: identical timing, no jQuery dependency.
+   *
+   * Either way the repair runs synchronously inside the same macrotask as
+   * Typora's render + caret restore, so the browser paints a single frame
+   * that is already in source view. The MutationObserver guard stays as the
+   * fallback and is now non-destructive.
+   */
+  private attachCursorChangeHook(): () => void {
+    const write = editor.writingArea
+    if (!write) return () => { /* nothing attached */ }
+
+    const jq: any = (window as any).jQuery ?? (window as any).$
+    if (jq && typeof jq.fn?.on === 'function') {
+      const handler = () => this.renderService.repairAfterRender(write)
+      try {
+        jq(write).on('cursorChange', handler)
+        return () => {
+          try { jq(write).off('cursorChange', handler) } catch { /* best effort */ }
+        }
+      } catch { /* fall through to the brush wrapper */ }
+    }
+
+    const brush: any = (editor as any).brush
+    const original = brush?.expand
+    if (typeof original !== 'function') return () => { /* nothing attached */ }
+    const service = this.renderService
+    brush.expand = function (...args: unknown[]) {
+      try {
+        return original.apply(this, args)
+      } finally {
+        service.repairAfterRender(write)
+      }
+    }
+    return () => {
+      try { brush.expand = original } catch { /* best effort */ }
+    }
+  }
 
   /** Panel-only refresh (editor rendering is the framework's business). */
   private schedulePanelRefresh(): void {

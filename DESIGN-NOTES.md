@@ -1,6 +1,73 @@
 # CriticMarkup Review for Typora — 设计决策速查
 
-> v0.4.0（2026-10-04 第九轮）。所有决策均已用户拍板或由调研证实。
+> v0.4.3（2026-10-04 第十二轮）。所有决策均已用户拍板或由调研证实。
+
+## v0.4.3 残留闪烁（只有光标所在那一个标记闪）的真正根因：reveal 是"每帧重算的派生量"（第十二轮）
+
+v0.4.2 之后整行不再闪，但**输入 / IME 上屏 / 删除时，光标所在的那一处标记仍会闪成渲染态（色块 / 徽章 chip）**，随后又回源码。实测三种输入方式全中 ⇒ 不是时序漏网，而是**表示方式本身不稳定**。
+
+**取证（读 `src/render/critic-processor.ts` 现状）**：
+1. reveal 的唯一载体是 **span 上的 `.is-raw` class**，而 span 被反复销毁重建（Typora `$(block).html()` 重写、我们自己的 `unwrapBlock`+rewrap）。于是**每一个 pass 都必须重新"解析出 key → 贴 class"**；任何一个 pass 解析落空 ⇒ 那一帧该 unit 没有 `.is-raw` ⇒ chip 上屏，直到 150ms 后 selectionchange 才补回。块里其他 unit 本来就不是 raw 态，所以症状精确表现为"只有光标所在那一块在闪"。v0.4.2 的 `allowClear=false` 只堵住了守卫/`cursorChange` 两条路径，`handleCaretMove`、`process()` 全量 pass 仍在"决策落空 = 摘掉"。
+2. **身份用的是 raw 字符串 `data-critic-raw-key`，编辑时必然漂移**：输入/删除/上屏会改 raw。快速路径 A 不 rewrap ⇒ wrapper 上的 key 停在旧值（= `lastRevealKey`）；等 Typora brush 重渲染后 rewrap 出新 span（新 key），回退链两条全废 —— `seed = caretOffset >= 0 ? caretOffset : lastCaretOffset` 在"offset=0 伪读"时错误地优先用 0；`blockHasKey(block, lastRevealKey)` 拿旧字符串比新 span，**构造性地必 miss**。只剩 `unitAtOffset(lastCaretOffset)` 一条兜底，删除/上屏后偏移漂移或 token↔consumed 形状翻转导致区间变化时即丢失。
+3. 打字时 `keyup` 让 `userIntentAt` 永远新鲜 ⇒ `handleCaretMove` 的 allowClear 恒为 true，任何一次读到错误块/错误偏移就会摘掉当前 unit。
+
+**v0.4.3 三条规则（把"派生量"改成"持久状态 + 同步投影"）**：
+1. **真源上移**：`block.dataset.criticReveal = <单元序号>`。一个块元素属性，Typora 重写 innerHTML 时天然存活；`unwrapBlock` 不删它。
+2. **身份换成序号**：units 排序后按下标编号，写入 `data-critic-unit`（segment span 与 consumed 的原生 `mark/del` 都写）。输入/删除/raw 漂移/形状翻转都不改变序号 ⇒ reveal 无法漂移。
+3. **只投影、不清除**：`syncReveal(block)` 只读真源、把 `.is-raw` / `.critic-anchor-reveal` / `.critic-subst-reveal` 同步到 DOM；`processBlock`、`processCaretBlock` 的 rewrap 路径、守卫、`repairAfterRender`、`compositionend`、框架全量 pass 全部以投影收尾 ⇒ **重建 wrapper 在结构上不可能丢 reveal**。摘除只能走 `clearReveal()`，且必须过 `clearGate()`：编辑器静止（距最后一次编辑类 mutation ≥ `QUIET_MS=250`）+ 二次确认（两次落空读相隔 ≥ `CONFIRM_MS=120`）+ 确有用户意图。打字/上屏/删除 200ms 内必 mutation ⇒ 静止期一条就全挡掉。
+
+**配套修正**：
+- `renderSuspectedAt` 只由"编辑类" mutation 打点（块内有 `{` / 有我们的 wrapper / 是光标块 / 有 reveal 真源），否则 Typora 常驻装饰性 mutation 会永久锁死清除。
+- `restoreCaret` 遇不可信读（offset=0 伪读）直接跳过，不再把光标拽到块首。
+- Typora 整块换 `<p>` 时 `adoptReveal()` 把真源复制到继任元素。
+- 门控拦下的清除交给**有界重扫**（`runRevealRecheck`，最多 5 次，扫 `[data-critic-reveal]`），避免出现"永不收回的源码态"。
+- **CSS 加固带**：`style.scss` 用 `@for 0..24` 生成 `[data-critic-reveal="N"] [data-critic-unit="N"]` 的源码态规则（与 `.is-raw` 共用 `@mixin critic-raw-body`）。即便存在没想到的 JS 路径忘了投影，也不会出现"wrapper 已建、源码态未上"的帧 —— 投影于是从竞态降级为优化。
+- **诊断**：`debugDump()` 增 `revealAttr / lastRevealOrdinal / suppressed / gate / TRACE`（最近 12 条决策）。健康编辑会话：`kept` 连续增长、`suppressed` > 0、`cleared` 不因打字增长、`revealAttr` 始终等于 `lastRevealOrdinal`。
+
+### v0.4.3.1 两个"新机制自己踩自己"的坑（第十二轮补丁）
+
+1. **wrapper schema 版本**：v0.4.3 给 span 加了 `data-critic-unit`，但 `data-critic-sig` 只看文本 ⇒ 旧构建包出来的 span（无该属性）在每次 pass 都命中快速路径，**永远不会被重建**，`applyReveal` 找不到任何 `[data-critic-unit]` ⇒ 升级后 reveal 根本投影不上去（表现：打字时该 unit 恒为渲染态）。修法：签名前缀 `WRAP_SCHEMA='v3'`，wrapper 携带的属性集一变就 bump（代价：升级后每块多一次 rewrap）。**诊断要点**：dump 里 `unitSpans` 必须为 revealed 段数，为 0 即命中此坑。
+2. **dump 命令自己清掉了要观测的状态**：`debug-dump-block` 注册为 `scope:'global'`，从命令面板调用会**抢走焦点** → `handleCaretMove` 走"焦点离开编辑器"分支 → 无条件 `clearReveal` + `lastCaretOffset=-1` ⇒ 任何 dump 必然显示 `revealKey=null / lastCaretOffset=-1`，永远拍不到闪烁。修法：焦点离开的清除也过 `clearGate()`（被拦下则交有界重扫），且 dump 增补**不落库**的 `resolveNow`（当场算光标解到哪个 ordinal）与 `unitSpans/schema/sig`。
+
+## v0.4.2 闪徽章的真正修法：修在 `cursorChange`，而不是 MutationObserver（第十一轮，Typora 源码确认）
+
+v0.4.0 / v0.4.1 都还在闪 —— 本轮直接读 `D:\Program Files\Typora\resources\appsrc\window\frame.js`（1.7MB bundle，Typora 编辑器内核全在里面）确认时序，结论是**修复的时机根本选错了**。
+
+**取证（全部来自 frame.js 源码）**：
+- `editor.brush`：`this.interval = 200`，`scheduleNext` 用 `setTimeout(async () => { await brushQueue(); scheduleNext() }, 200)` 常驻轮询。
+- 入队：input/beforeinput 分支 `h.brush.addToQueue(h.focusCid)`；Backspace/Delete 分支同样 `h.brush.addToQueue(h.focusCid)`；IME 上屏的 `p()` 里 `h.isIME = 0; setTimeout(() => h.brush.brushQueue(), 10)` ⇒ **每上屏一个字 / 每次删除必有一次重渲染**。
+- 重渲染 `E() → m()`：`s = e[0].cloneNode(true)`（当前 DOM，**含**我们的 `[data-critic-seg]` span）与 `l.innerHTML = n.innerHtml`（重新生成，**不含**）比 innerHTML，`f(s), f(l)` 只剥 `cid/contenteditable/id`，**两者必然不等** ⇒ 走 `e.html(a)`（jQuery 覆盖 innerHTML）⇒ wrapper 与 `.is-raw` 每次全丢。
+- `brushQueue` 顺序：`await Promise.all(queue.map(E))` → `s.queue = []` → `t && i && s.editor.undo.exeCommand(i)`（**恢复光标**）→ `this.expand(true, false, n)` → expand 各分支末尾 `$(editor.sessionStr).trigger("cursorChange", editor.styleBookmark)`。
+- Typora 自己的语法显示（`md-expand`）正是"渲染之后、光标已恢复"时同步补回的：`$(".md-expand").removeClass("md-expand")` … `F(e.addClass("md-expand")…)`。它从不闪，就是因为补在正确时机。
+- `window.$ = window.jQuery` 在 module "50" 被全局赋值 ⇒ **可以用 jQuery 监听 `cursorChange`**（jQuery `.trigger` 不派发原生 DOM 事件，原生 `addEventListener` 收不到）。
+
+**v0.4.1 为什么没生效**：断言"选区不可读时 `findCaret` 返回 null"是错的。Chromium 在 innerHTML 被整体替换后会把选区**塌到块首**，于是 `findCaret` 返回的是一个**合法但 offset = 0** 的 caret —— `!caret` 分支永不进入，v0.4.1 的续期链因此根本没跑；代码把它当成"用户把光标移到了块首"，解析不到 unit → `syncRawState(block, null, null)` → **摘掉 `.is-raw`** → 徽章上屏，直到 150ms 后 selectionchange 才补回源码。
+
+**v0.4.2 两条规则**：
+1. **REPAIR 永不清除**。把"修复"与"清除"彻底分离：`MutationObserver` 守卫、框架 post-processor 全量 pass、`compositionend`、`cursorChange` 全是修复路径，只能重建 wrapper + 续期上一次 reveal；`syncRawState(..., allowClear=false)` 在解析落空时**直接 return**（一个 class 都不动）。只有 `handleCaretMove` 在**光标可信 + 确有用户意图（mousedown/click/keyup，400ms 窗口）或跨块跳转**时才允许清除。
+2. **权威修复挂在 `cursorChange`**。新增 `repairAfterRender(containerEl)`：在 Typora 完成"重渲染 + 恢复光标"之后、同一宏任务内同步跑，只处理光标块 + 脏块（不遍历全部 leaf，`cursorChange` 很频繁）。浏览器于是只绘制一帧，且该帧已是源码态。守卫降级为兜底，且已非破坏性。
+   - 主传输：jQuery `$(editor.writingArea).on('cursorChange', …)`；兜底：包一层 `editor.brush.expand`（`try/finally` 中原样返回），两者都 try/catch，`onunload` 还原。
+
+**可信光标判定**：`isCaretTrustworthy(caret)` —— caret 缺失、offset < 0，或"offset 恰为 0 且 `lastCaretOffset > 0` 且距最近一次编辑器 mutation 不足 400ms（`RENDER_SUSPECT_WINDOW`）"→ 不可信。窗口限制保证用户真的按 Home/点到块首时，下一次 selectionchange 仍会正常清除，不会留下永不消失的源码态。
+**防污染**：`processCaretBlock` 与 `handleCaretMove` 只在可信时写入 `lastCaretOffset`，否则 offset-0 假值会毒化所有续期回退。
+**诊断**：`debugDump()` 增补 `repairSource / repairs / kept / cleared / caretTrusted / renderSuspectAge / userIntentAge`。健康编辑应表现为 `kept` 单调增长、`cleared` 不因打字而增长。
+
+## v0.4.1 打字闪徽章的最终根因：Typora brush 的 await 窗口（第十轮，实测取证）
+
+高亮配色已解决，本轮专攻"每上屏一个字/按删除都先闪成徽章（渲染态）再回源码"。
+
+**取证（`resources/appsrc/window/frame.js`）**：
+- 每次输入/删除都走 `beforeinput(insertText)` → `selection.prepNode()`（或 Backspace → `UserOp.backspaceHandler()`）改 DOM 并 `brush.addToQueue(cid)`。
+- brush 是 **`setTimeout(…, 200)` 宏任务**队列（`interval=200`）：约 200ms 后 `brushQueue` 从 AST 重建该块 inline DOM（销毁我们的 wrapper span）。
+- `brushQueue` 是 **async**：`i = selection.buildUndo()`（保存选区）→ `await Promise.all(… E.call … 重建 DOM …)` → **之后才** `exeCommand(i)` 恢复选区。`await` 处 JS 栈展开触发微任务检查点——**我们的 MutationObserver 守卫恰在此窗口运行，此时选区挂在已摘除的节点上**。
+- `brushQueue` 开头 `isIME ||` 短路：组字期间不跑，`compositionend`（isIME 清零）后 ~200ms 必跑一次 ⇒ "每上屏一个字闪一次"；Backspace 同样入队 ⇒ "按删除也闪"。
+
+**缺陷链**：守卫里 `findCaret(root)` 返回 null（或整块 `<p>` 被替换、`lastCaretBlock` 引用失配）→ v0.4.0 的术后兜底 `post ? resolve : {key:null}` → `syncRawState(block, null)` **主动摘掉 `.is-raw`** → 徽章渲染 → Typora `exeCommand` 恢复选区触发 `selectionchange`（150ms 防抖）→ `handleCaretMove` 重新点亮 → 回源码。可见闪烁 ≈150ms。
+
+**v0.4.1 三条规则**：
+1. **选区不可读绝不主动清 reveal（续期链）**：`processCaretBlock` 重包裹分支里 `!post` 时——① `unitAtOffset(units, caretOffset)` 宽容闭区间命中（守卫喂的是 `lastCaretOffset`，每次成功读光标都刷新、含刚输入字符、偏差至多 ±1）取该单元**新 key**；② 仍无 → `lastRevealKey` + `blockHasKey`（文本未变、Typora 仅重建 DOM 时新旧 key 相同，直接续期）。**post 可读时行为与 v0.4.0 完全一致**（可读且在单元外 → 尊重 null → 渲染，光标移出语义不回归）。key 匹配一律走 `dataset` 逐个比对，不拼属性选择器（raw 含 `{`/`|`/`<` 会 throw）。
+2. **块收养**：守卫发现 `lastCaretBlock` 失联（isConnected/contains 均 false）且脏块恰为单块时，收养该块走 `processCaretBlock(block, lastCaretOffset, null)`（函数入口即刷新 `lastCaretBlock`），并补 `lastRevealKey` 匹配兜底；多块 + 选区不可读属罕见场景，保守走 `processBlock`。
+3. **焦点守卫**：`handleCaretMove` 的 `!caret` 分支不再无差别当"光标离开编辑器"——`document.activeElement` 是 `containerEl`/其后代/`body`/null 时视为 Typora 手术窗口的瞬时不可读，直接 return 保持现状；焦点真到面板/弹窗才清空 reveal。代价：点击不可聚焦区域时源码态可能多停留到下一次光标移动，属可接受折衷。
 
 ## v0.4.0 打字闪烁根因 + 锚点配色硬化（第九轮实测两问题）
 
@@ -117,7 +184,7 @@
 ## 交付状态
 
 - vitest 23/23 全绿（critic-thread 14 + critic-core 9）；tsc --noEmit 零错误；esbuild 生产构建通过
-- 产物：dist/main.js + dist/main.css + manifest.json → criticmarkup-review.zip（v0.4.0）
+- 产物：dist/main.js + dist/main.css + manifest.json → criticmarkup-review.zip（v0.4.1）
 - 构建必须用 `npm run build`（= `node build.js --prod`）才会 minify；直接 `node build.js` 出的是带 sourcemap 的开发包
 - v0.4.0 的两个问题（打字闪烁、锚点金黄）均已修复（根因见上）；**修复效果待用户实机复测**
 - 锚点若仍偏金黄：F1 跑 `Debug: Dump Block DOM at Cursor`，把剪贴板内容贴回来即可精确定位

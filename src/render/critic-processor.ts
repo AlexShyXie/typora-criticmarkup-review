@@ -51,6 +51,77 @@ import type {
  * `.md-meta` inside revealed units (style.scss v0.3.1). Typing inside a
  * unit must NEVER rewrap (IME composition safety): see processCaretBlock's
  * caret-stamp fast paths.
+ *
+ * v0.4.2 TIMING MODEL (the real cause of the typing flash — measured in
+ * Typora 1.14.10's own source, `resources/appsrc/window/frame.js`):
+ *
+ *   1. `editor.brush` polls every 200ms (`brush.interval = 200`) and every
+ *      keystroke / delete pushes the caret block into `brush.queue`
+ *      (`h.brush.addToQueue(h.focusCid)`). An IME commit runs
+ *      `setTimeout(brushQueue, 10)` on top of that.
+ *   2. `brushQueue` renders via `E() -> m()`, which compares the CURRENT
+ *      block DOM against freshly generated HTML. Our wrapper spans only
+ *      exist in the former, so the two ALWAYS differ and Typora does
+ *      `$(block).html(newHtml)` — every wrapper and every `.is-raw` is gone.
+ *   3. `brushQueue` is async: it only restores the caret AFTER the render
+ *      (`undo.exeCommand(i)`), then calls `brush.expand()`, which ends with
+ *      `$(editor.sessionStr).trigger("cursorChange", styleBookmark)`.
+ *   4. Our MutationObserver is a MICROTASK: it lands between (2) and (3),
+ *      i.e. while the selection is still destroyed by the innerHTML write.
+ *      Chromium collapses it to the block start, so `findCaret` returns a
+ *      caret at offset 0 (NOT null — which is why v0.4.1's `!caret` branch
+ *      never fired). Resolving a unit from offset 0 fails, and the old code
+ *      then did `syncRawState(block, null, null)` — clearing `.is-raw` and
+ *      painting the badge until the next 150ms selectionchange.
+ *
+ * Two rules follow, and they are what v0.4.2 implements:
+ *   - REPAIR (mutation guard, post-processor pass, compositionend) must
+ *     never clear the reveal. It rebuilds wrappers and re-applies the last
+ *     known reveal; an untrustworthy caret only makes it fall back.
+ *   - The authoritative repair runs at Typora's own `cursorChange`, i.e.
+ *     after the render AND after the caret is restored, synchronously in
+ *     the same macrotask — so the browser paints one frame, already in
+ *     source view. (Typora does the same for `md-expand`, which is exactly
+ *     why its own syntax reveal never flashes.)
+ *
+ * v0.4.3 TRUTH MODEL (the residual "only the caret's own token flashes"):
+ * v0.4.2 stopped the WHOLE LINE from flashing, but the single unit under
+ * the caret still blinked into a chip on every keystroke / IME commit /
+ * delete. The reason is structural, not another timing hole:
+ *
+ *   1. The reveal lived ONLY as a `.is-raw` class on our wrapper spans,
+ *      and those spans are destroyed and rebuilt constantly (Typora's
+ *      `$(block).html()` rewrite, our own `unwrapBlock` + rewrap). Every
+ *      single pass therefore had to RE-DERIVE "which unit is revealed"
+ *      and re-apply the class. Any pass whose derivation came up empty
+ *      painted one frame without `.is-raw` — the chip. Every other unit in
+ *      the block is never raw anyway, so the symptom is exactly "only the
+ *      token the caret sits in blinks".
+ *   2. The derivation was keyed on the RAW STRING (`data-critic-raw-key`),
+ *      which changes with every character typed. The last remembered key
+ *      is therefore stale by construction after an edit, so the fallback
+ *      (`blockHasKey(lastRevealKey)`) misses on the freshly rebuilt spans;
+ *      `seed = caretOffset >= 0 ? caretOffset : lastCaretOffset` also
+ *      preferred the offset-0 artefact over the remembered offset.
+ *
+ * So v0.4.3 turns the reveal from "a value every pass recomputes" into
+ * "persistent state + synchronous projection":
+ *
+ *   - TRUTH: `block.dataset.criticReveal = <unit ordinal>`. One attribute
+ *     on the leaf block, which survives Typora's innerHTML rewrites.
+ *   - IDENTITY: the unit's ORDINAL inside the block (`data-critic-unit`),
+ *     not its raw string — typing inside a unit never changes its ordinal,
+ *     so the reveal cannot drift.
+ *   - PROJECTION: `syncReveal(block)` copies the truth onto the spans
+ *     (`.is-raw`) and the consumed natives (`.critic-anchor-reveal` /
+ *     `.critic-subst-reveal`). Rebuilding wrappers can now NEVER lose the
+ *     reveal: every reconstructing pass ends with a projection.
+ *   - CLEARING: only an explicit `clearReveal()` may drop the truth, and
+ *     it must pass `clearGate()` — editor quiescent (>= QUIET_MS since the
+ *     last edit mutation), real user intent, and a second confirming read
+ *     (>= CONFIRM_MS apart). Typing / IME / delete all mutate within
+ *     200ms, so the quiescence rule alone suppresses every edit-driven
+ *     clear; a stale truth is swept by a bounded recheck timer.
  */
 
 const LEAF_BLOCK_SELECTOR = [
@@ -59,6 +130,47 @@ const LEAF_BLOCK_SELECTOR = [
 ].join(',')
 
 const WRAPPER_SELECTOR = 'span[data-critic-seg]'
+
+/**
+ * v0.4.3.1: wrapper SCHEMA version, part of every block signature.
+ *
+ * v0.4.3 added `data-critic-unit` to the wrapper spans. Blocks wrapped by an
+ * older build carry spans WITHOUT it, and their `data-critic-sig` still
+ * matches (the text did not change), so every pass hit a fast path and never
+ * re-wrapped them — `applyReveal` then found no `[data-critic-unit]` element
+ * and could not project the reveal at all. Bump this whenever the attributes
+ * the wrappers carry change: it forces exactly one rewrap per block.
+ */
+const WRAP_SCHEMA = 'v3'
+
+/**
+ * v0.4.2: how long after a mutation we still mistrust a caret read of
+ * offset 0. Typora's brush rewrites the block and only restores the caret
+ * a few microtasks later; 400ms comfortably covers that window while a real
+ * "move to block start" gets honoured on the following selectionchange.
+ */
+const RENDER_SUSPECT_WINDOW = 400
+
+/**
+ * v0.4.3: how long the editor must be free of edit mutations before a
+ * "the user left the markup" clear is believed. Typora's brush re-renders
+ * ~200ms after every edit, so any real editing keeps this rule failing.
+ */
+const QUIET_MS = 250
+
+/**
+ * v0.4.3: a clear needs a SECOND confirming read, at least this far from
+ * the first one. Guards against a single bogus caret read landing outside
+ * the unit while Typora is rebuilding the line.
+ */
+const CONFIRM_MS = 120
+
+/**
+ * v0.4.3: when a repair must guess which unit was revealed and neither the
+ * remembered offset nor the remembered ordinal hits, accept a unit whose
+ * range is within this many characters of the remembered caret offset.
+ */
+const NEAR_TOLERANCE = 12
 
 interface Segment {
   from: number
@@ -73,6 +185,12 @@ interface Segment {
  * `from`/`to` are offsets into the block's textContent (DOM space).
  */
 export interface RevealUnit {
+  /**
+   * v0.4.3: ordinal of this unit inside its block (index into the sorted
+   * `units` array). This — not `key` — is the reveal's identity: it does
+   * not change when the user types or deletes inside the unit.
+   */
+  index: number
   from: number
   to: number
   /** is-raw / data-critic-raw-key lookup key (DOM-space raw). */
@@ -144,6 +262,7 @@ function detectConsumedAnchors(
     const cand = candidates.find(c => c.from === r.from - 1 && c.to === r.to + 1)
     if (!cand) return
     units.push({
+      index: -1, // assigned by buildRevealUnits after sorting
       from: cand.from,
       to: cand.to,
       key: cand.raw,
@@ -175,6 +294,7 @@ function detectConsumedSubstitutions(
     const cand = candidates.find(c => c.from === r.from - 1 && c.to === r.to + 1)
     if (!cand) return
     units.push({
+      index: -1, // assigned by buildRevealUnits after sorting
       from: cand.from,
       to: cand.to,
       key: cand.raw,
@@ -193,6 +313,7 @@ function buildRevealUnits(
   const units: RevealUnit[] = []
   for (const token of tokens) {
     units.push({
+      index: -1, // assigned by buildRevealUnits after sorting
       from: token.from,
       to: token.to,
       key: token.raw,
@@ -204,6 +325,9 @@ function buildRevealUnits(
   units.push(...detectConsumedAnchors(block, text, tokens))
   units.push(...detectConsumedSubstitutions(block, text, tokens))
   units.sort((a, b) => a.from - b.from || a.to - b.to)
+  // v0.4.3: stamp the ordinal AFTER sorting — it is the stable identity
+  // used by `data-critic-unit` and by the block-level reveal truth.
+  units.forEach((u, i) => { u.index = i })
   return units
 }
 
@@ -323,11 +447,349 @@ export class CriticRenderService {
   private lastCaretOffset = -1
   private lastRevealKey: string | null = null
   private lastRevealUnit: RevealUnit | null = null
+  /**
+   * v0.4.3: the ordinal of the unit currently in source view — the identity
+   * that does NOT drift when the user types (unlike `lastRevealKey`).
+   */
+  private lastRevealOrdinal: number | null = null
   private dirtyBlocks = new Set<HTMLElement>()
 
-  private rememberReveal(key: string | null, unit: RevealUnit | null): void {
-    this.lastRevealKey = key
+  /**
+   * v0.4.2: timestamp of the last mutation the guard saw inside the editor.
+   * For `RENDER_SUSPECT_WINDOW` after it, a caret read of offset 0 is
+   * treated as the "collapsed by an innerHTML rewrite" artefact instead of
+   * a genuine move to the block start (see `isCaretTrustworthy`).
+   */
+  private renderSuspectedAt = 0
+  /** v0.4.2: timestamp of the last real user interaction (click / keyup). */
+  private userIntentAt = 0
+
+  /**
+   * v0.4.3: timestamp of the first "the caret is not in any unit" read that
+   * wanted to clear. A clear is only executed on a SECOND read at least
+   * `CONFIRM_MS` later (see `clearGate`).
+   */
+  private pendingMissAt = 0
+  /** v0.4.3: bounded self-healing sweep for a reveal the gate refused. */
+  private recheckTimer: number | undefined = undefined
+  private recheckAttempts = 0
+
+  /** v0.4.2 diagnostics: which hook repaired last, and how it decided. */
+  private lastRepairSource = 'none'
+  private repairCount = 0
+  private keepCount = 0
+  private clearCount = 0
+  /** v0.4.3: clears the gate refused (this is the good case while typing). */
+  private suppressedCount = 0
+  /** v0.4.3: ring buffer of reveal decisions, dumped by `debugDump()`. */
+  private revealTrace: string[] = []
+
+  private rememberReveal(ordinal: number | null, unit: RevealUnit | null): void {
+    this.lastRevealOrdinal = ordinal
     this.lastRevealUnit = unit
+    this.lastRevealKey = unit?.key ?? null
+  }
+
+  /** v0.4.2: called from the plugin on mousedown / click / keyup. */
+  markUserIntent(): void {
+    this.userIntentAt = Date.now()
+  }
+
+  /** v0.4.2: did the user actually interact within `window` ms? */
+  private hasRecentUserIntent(window = 400): boolean {
+    return this.userIntentAt > 0 && Date.now() - this.userIntentAt < window
+  }
+
+  /**
+   * v0.4.2 — the authoritative repair entry point.
+   *
+   * Called from Typora's own `cursorChange` (jQuery custom event on
+   * `#write`), which `brush.expand()` fires at the END of every
+   * `brushQueue` tick — i.e. after the block was re-rendered AND after
+   * `undo.exeCommand(i)` restored the caret. Repairing here means the
+   * browser paints a single frame, already in source view; the MutationObserver
+   * (a microtask that lands before the caret is restored) can only ever be a
+   * fallback.
+   *
+   * Semantics: rebuild wrappers, re-apply the last known reveal,
+   * NEVER clear `.is-raw`. Scoped to the caret block (+ dirty blocks) —
+   * `cursorChange` fires often, so no full-document walk here.
+   */
+  repairAfterRender(containerEl: HTMLElement): void {
+    if (!containerEl || !containerEl.isConnected) return
+    // IME: DOM surgery mid-composition duplicates CJK input.
+    if (this.composing || this.acceptedView) return
+    // Prefer the guard root, but only while it is still the live editor
+    // (Typora swaps #write wholesale on a file switch).
+    const guard = this.guardRoot
+    const root = guard && guard.isConnected ? guard : containerEl
+    this.lastRepairSource = 'cursorChange'
+    this.repairCount++
+
+    const pending = Array.from(this.dirtyBlocks)
+    this.dirtyBlocks.clear()
+    const caret = this.findCaret(root)
+    const block = caret?.block ?? this.lastCaretBlock
+    const allowClear = this.isCaretTrustworthy(caret)
+    // v0.4.3: Typora can swap the whole <p>; carry the reveal truth over.
+    const prev = this.lastCaretBlock
+    if (prev && block && prev !== block && !prev.isConnected) this.adoptReveal(prev, block)
+
+    this.surgery = true
+    try {
+      for (const b of pending) {
+        if (!b.isConnected || !root.contains(b)) continue
+        if (caret && b === caret.block) continue
+        // v0.4.3: a non-caret block is only re-wrapped and re-projected;
+        // it can never "decide" to drop a reveal any more.
+        this.processBlock(b)
+      }
+      if (block && block.isConnected && root.contains(block)) {
+        if (caret && block === caret.block) {
+          this.processCaretBlock(block, caret.offset, caret.anchorEl, allowClear)
+        } else {
+          this.processCaretBlock(block, this.lastCaretOffset, null, false)
+        }
+      }
+    } finally {
+      this.surgery = false
+    }
+  }
+
+  /**
+   * v0.4.2: can this caret read be believed?
+   *
+   * A read is untrustworthy when the selection is missing, or when it sits
+   * at offset 0 right after Typora rewrote the block (Chromium collapses the
+   * selection to the block start when its text node is removed) while we
+   * still remember a deeper offset. Treating that artefact as a real caret
+   * is precisely what cleared `.is-raw` and painted the badge.
+   */
+  private isCaretTrustworthy(
+    caret: { block: HTMLElement; offset: number } | null,
+  ): boolean {
+    if (!caret) return false
+    if (caret.offset < 0) return false
+    if (caret.offset === 0
+      && this.lastCaretOffset > 0
+      && Date.now() - this.renderSuspectedAt < RENDER_SUSPECT_WINDOW) {
+      return false
+    }
+    return true
+  }
+
+  // ------------------------------------------------- v0.4.3 reveal truth
+
+  /**
+   * v0.4.3: read the truth — the ordinal of the unit in source view, kept
+   * on the LEAF BLOCK (which survives Typora's innerHTML rewrites).
+   */
+  private readReveal(block: HTMLElement): number | null {
+    const raw = block.dataset.criticReveal
+    if (raw === undefined || raw === '') return null
+    const n = Number(raw)
+    return Number.isInteger(n) && n >= 0 ? n : null
+  }
+
+  /**
+   * v0.4.3: write the truth and project it. Revealing is always allowed —
+   * it is never a destructive act (the previous unit's classes go away as a
+   * side effect of the projection).
+   */
+  private setReveal(block: HTMLElement, ordinal: number | null, unit: RevealUnit | null): void {
+    if (ordinal == null) return
+    this.pendingMissAt = 0
+    block.dataset.criticReveal = String(ordinal)
+    this.rememberReveal(ordinal, unit)
+    this.applyReveal(block, ordinal)
+  }
+
+  /**
+   * v0.4.3: PROJECTION ONLY — copy the truth onto the DOM.
+   *
+   * Called at the end of every pass that (re)builds wrappers. It never
+   * re-derives and never clears, which is precisely why rebuilding the
+   * wrappers can no longer drop the source view.
+   */
+  private syncReveal(block: HTMLElement): void {
+    this.applyReveal(block, this.readReveal(block))
+  }
+
+  /** v0.4.3: the ONLY way to drop the truth. Callers must pass `clearGate`. */
+  private clearReveal(block: HTMLElement): void {
+    this.pendingMissAt = 0
+    delete block.dataset.criticReveal
+    this.applyReveal(block, null)
+  }
+
+  /**
+   * v0.4.3: project `ordinal` onto every element carrying a unit ordinal:
+   * `.is-raw` on our segments, and the `==` / `~~` synthesis classes on the
+   * consumed native elements. Everything else is cleared.
+   */
+  private applyReveal(block: HTMLElement, ordinal: number | null): void {
+    const ord = ordinal == null ? null : String(ordinal)
+    block.querySelectorAll<HTMLElement>('[data-critic-unit]').forEach(el => {
+      const on = ord !== null && el.dataset.criticUnit === ord
+      el.classList.toggle('is-raw', on)
+      const tag = el.tagName
+      if (tag === 'MARK') {
+        el.classList.toggle('critic-anchor-reveal', on)
+      } else if (tag === 'DEL' || tag === 'S' || tag === 'STRIKE') {
+        el.classList.toggle('critic-subst-reveal', on)
+      }
+    })
+  }
+
+  /**
+   * v0.4.3: Typora sometimes swaps the whole `<p>`; carry the truth over to
+   * the successor element so the replacement does not end the reveal.
+   */
+  private adoptReveal(from: HTMLElement | null, to: HTMLElement): void {
+    if (!from || from === to) return
+    const ordinal = this.readReveal(from)
+    if (ordinal != null) {
+      to.dataset.criticReveal = String(ordinal)
+      return
+    }
+    // Fall back to the remembered ordinal only when the successor really
+    // looks like the same paragraph — otherwise a file switch could stamp
+    // the reveal onto an unrelated block.
+    if (this.lastRevealOrdinal != null && (to.textContent ?? '').includes('{')) {
+      to.dataset.criticReveal = String(this.lastRevealOrdinal)
+    }
+  }
+
+  /**
+   * v0.4.3: the clear gate. All three must hold:
+   *   1. the editor is QUIESCENT (no edit mutation for `QUIET_MS`) — typing,
+   *      IME commits and deletes all mutate inside 200ms, so this alone
+   *      suppresses every edit-driven clear;
+   *   2. a first miss was already recorded and a second read at least
+   *      `CONFIRM_MS` later confirms it;
+   *   3. the user really interacted (click / key) recently.
+   *
+   * @param readOnly v0.4.3: diagnostics only — do NOT arm the first miss.
+   * @returns 'ok' = proceed, otherwise the reason it was refused.
+   */
+  private clearGate(readOnly = false): 'ok' | 'quiet' | 'confirm' | 'intent' {
+    if (Date.now() - this.renderSuspectedAt < QUIET_MS) return 'quiet'
+    const now = Date.now()
+    if (this.pendingMissAt <= 0) {
+      if (!readOnly) this.pendingMissAt = now
+      return 'confirm'
+    }
+    if (now - this.pendingMissAt < CONFIRM_MS) return 'confirm'
+    if (!this.hasRecentUserIntent()) return 'intent'
+    return 'ok'
+  }
+
+  /** v0.4.3: bounded self-healing sweep for a truth the gate refused. */
+  private scheduleRevealRecheck(): void {
+    if (this.recheckTimer !== undefined) return
+    this.recheckAttempts = 0
+    this.recheckTimer = window.setTimeout(() => this.runRevealRecheck(), CONFIRM_MS + 30)
+  }
+
+  private runRevealRecheck(): void {
+    this.recheckTimer = undefined
+    const root = this.guardRoot
+    if (!root || !root.isConnected) return
+    const caret = this.findCaret(root)
+    let stale = false
+    // (a) blocks the caret is NOT in: a leftover reveal there is always stale.
+    root.querySelectorAll<HTMLElement>('[data-critic-reveal]').forEach(block => {
+      if (block.querySelector(LEAF_BLOCK_SELECTOR)) return
+      if (caret && block === caret.block) return
+      if (this.clearGate() === 'ok') {
+        this.clearReveal(block)
+        this.processBlock(block)
+      } else {
+        stale = true
+      }
+    })
+    // (b) the caret block itself: re-evaluate the unit membership (this sweep
+    // exists because a re-evaluation wanted to clear and the gate refused).
+    // Skipping it would leave "clicked out of the unit" permanently revealed.
+    if (caret && this.readReveal(caret.block) != null) {
+      const before = this.readReveal(caret.block)
+      this.lastRepairSource = 'recheck'
+      this.processCaretBlock(caret.block, caret.offset, caret.anchorEl, true)
+      if (this.readReveal(caret.block) === before) stale = true
+    }
+    if (stale && ++this.recheckAttempts < 5) {
+      this.recheckTimer = window.setTimeout(() => this.runRevealRecheck(), CONFIRM_MS + 30)
+    }
+  }
+
+  /**
+   * v0.4.3: the "untrustworthy caret" fallback chain, in ORDINAL space.
+   * Only consulted when the caller forbids clearing (every repair path).
+   *
+   *   1. the unit still containing `lastCaretOffset` (closed interval),
+   *   2. the last revealed ordinal, if that unit still exists,
+   *   3. the unit nearest to `lastCaretOffset` within `NEAR_TOLERANCE`.
+   *
+   * Note what is gone: the old `blockHasKey(lastRevealKey)` step compared a
+   * STALE raw string against freshly rebuilt spans, so it missed on every
+   * edit by construction.
+   */
+  private resolveRevealKeep(
+    block: HTMLElement, units: RevealUnit[],
+  ): { ordinal: number | null; unit: RevealUnit | null } {
+    const byOffset = this.unitAtOffset(units, this.lastCaretOffset)
+    if (byOffset) return { ordinal: byOffset.index, unit: byOffset }
+    const remembered = this.lastRevealOrdinal
+    if (remembered != null && remembered >= 0 && remembered < units.length) {
+      return { ordinal: remembered, unit: units[remembered] }
+    }
+    const near = this.nearestUnit(units, this.lastCaretOffset, NEAR_TOLERANCE)
+    if (near) return { ordinal: near.index, unit: near }
+    return { ordinal: null, unit: null }
+  }
+
+  /**
+   * v0.4.3: single place where a reveal decision is committed.
+   *
+   * `allowClear === false` marks a REPAIR: a miss runs the fallback chain
+   * and, failing that, leaves the truth untouched (suppressed).
+   * `allowClear === true` marks a real re-evaluation: a miss may clear, but
+   * only through `clearGate()`.
+   */
+  private commitReveal(
+    block: HTMLElement,
+    reveal: { ordinal: number | null; unit: RevealUnit | null },
+    units: RevealUnit[],
+    allowClear: boolean,
+  ): void {
+    let final = reveal
+    if (final.ordinal == null && !allowClear) {
+      final = this.resolveRevealKeep(block, units)
+    }
+    if (final.ordinal != null) {
+      this.keepCount++
+      this.setReveal(block, final.ordinal, final.unit)
+      this.traceDecision(final.ordinal, 'reveal')
+      return
+    }
+    if (allowClear && this.clearGate() === 'ok') {
+      this.clearCount++
+      this.rememberReveal(null, null)
+      this.clearReveal(block)
+      this.traceDecision(null, 'clear')
+      return
+    }
+    // Refused: project whatever the truth says (usually "still revealed")
+    // so this pass cannot become the "chip frame".
+    this.suppressedCount++
+    this.syncReveal(block)
+    if (allowClear) this.scheduleRevealRecheck()
+    this.traceDecision(this.readReveal(block), 'suppress')
+  }
+
+  private traceDecision(ordinal: number | null, action: string): void {
+    this.revealTrace.push(`${Date.now() % 100000} ${this.lastRepairSource} ${action} #${ordinal ?? '-'}`)
+    if (this.revealTrace.length > 40) this.revealTrace.shift()
   }
 
   private readonly onCompositionStart = (): void => {
@@ -346,33 +808,33 @@ export class CriticRenderService {
     // setTimeout(…, 0) is a macrotask, so the browser was free to paint the
     // half-rebuilt (rendered-looking) line before we restored the source
     // view — one flash per committed character.
+    this.lastRepairSource = 'compositionend'
+    this.repairCount++
     const pending = Array.from(this.dirtyBlocks)
     this.dirtyBlocks.clear()
     const caret = this.findCaret(root)
     const block = caret?.block ?? this.lastCaretBlock
-    if (pending.length > 0) {
-      this.surgery = true
-      try {
-        for (const b of pending) {
-          if (!b.isConnected || !root.contains(b)) continue
-          if (caret && b === caret.block) {
-            this.processCaretBlock(b, caret.offset, caret.anchorEl)
-          } else {
-            this.processBlock(b)
-          }
+    // v0.4.2: a committed character is a REPAIR, never a re-evaluation —
+    // clearing here is what made the badge blink once per character.
+    const allowClear = false
+    this.surgery = true
+    try {
+      for (const b of pending) {
+        if (!b.isConnected || !root.contains(b)) continue
+        if (caret && b === caret.block) continue
+        this.processBlock(b)
+      }
+      // The caret block itself may not have produced mutations we recorded
+      // (Typora can rebuild it in place), so always re-evaluate it too.
+      if (block && block.isConnected && root.contains(block)) {
+        if (caret && block === caret.block) {
+          this.processCaretBlock(block, caret.offset, caret.anchorEl, allowClear)
+        } else {
+          this.processCaretBlock(block, this.lastCaretOffset, null, allowClear)
         }
-      } finally {
-        this.surgery = false
       }
-    }
-    // The caret block itself may not have produced mutations we recorded
-    // (Typora can rebuild it in place), so always re-evaluate it too.
-    if (block && block.isConnected && root.contains(block)) {
-      if (caret && block === caret.block) {
-        this.processCaretBlock(block, caret.offset, caret.anchorEl)
-      } else if (!pending.includes(block)) {
-        this.processBlock(block)
-      }
+    } finally {
+      this.surgery = false
     }
   }
 
@@ -388,14 +850,28 @@ export class CriticRenderService {
   /** Re-render all critic markup within `containerEl` (editor or preview). */
   process(containerEl: HTMLElement): void {
     const caret = this.findCaret(containerEl)
+    // v0.4.2: the framework runs this ~400ms after every edit, which can
+    // land while the caret is still the collapsed artefact of Typora's
+    // innerHTML rewrite. Routing the remembered caret block through
+    // `processBlock` there clears `.is-raw` — the badge flash.
+    const trusted = this.isCaretTrustworthy(caret)
 
     const blocks = containerEl.querySelectorAll<HTMLElement>(LEAF_BLOCK_SELECTOR)
     blocks.forEach(block => {
       // Only leaves are processed (skip containers with nested blocks).
       if (block.querySelector(LEAF_BLOCK_SELECTOR)) return
       if (caret && block === caret.block) {
-        this.processCaretBlock(block, caret.offset, caret.anchorEl)
+        this.processCaretBlock(block, caret.offset, caret.anchorEl, trusted)
+      } else if (!trusted && block === this.lastCaretBlock) {
+        this.processCaretBlock(block, this.lastCaretOffset, null, false)
       } else {
+        // v0.4.3: a reveal left over on a block the caret is not in is
+        // swept here, but only through the gate — never unconditionally
+        // (an unconditional sweep was one of the "chip frame" sources).
+        if (this.readReveal(block) != null) {
+          if (this.clearGate() === 'ok') this.clearReveal(block)
+          else this.scheduleRevealRecheck()
+        }
         this.processBlock(block)
       }
     })
@@ -411,28 +887,74 @@ export class CriticRenderService {
   handleCaretMove(containerEl: HTMLElement): void {
     const caret = this.findCaret(containerEl)
     if (!caret) {
+      // v0.4.1 focus guard: an unreadable caret is NOT proof the user left
+      // the editor. This handler runs on a 150ms-debounced selectionchange,
+      // which can land inside Typora's own surgery window (brush removes and
+      // re-adds the selection ranges while rebuilding the line). Clearing
+      // the reveal then is exactly the "badge flashes, then source comes
+      // back" symptom. Only treat it as "left the editor" when the FOCUS
+      // really moved out (panel textarea, modal input, another window);
+      // while #write / content / body still holds focus, keep the current
+      // state and let the next selectionchange re-evaluate.
+      const active = document.activeElement
+      const focusInside = active === containerEl
+        || (active instanceof Node && containerEl.contains(active))
+        || active === document.body
+        || active === null
+      if (focusInside) return
       // Caret left the editor (panel / modal / elsewhere): re-wrap the
       // block that was showing raw markup, if any.
       const prev = this.lastCaretBlock
-      this.lastCaretBlock = null
-      this.lastCaretOffset = -1
-      this.rememberReveal(null, null)
       if (prev && prev.isConnected && containerEl.contains(prev)) {
-        this.processBlock(prev)
+        // v0.4.3.1: focus loss is GATED as well — no longer an unconditional
+        // clear. Our own "Debug: Dump …" command is a GLOBAL command, so
+        // invoking it (from the command palette) steals focus; an ungated
+        // clear destroyed the very state the dump is supposed to show, which
+        // is exactly why every dump read `lastCaretOffset=-1, revealKey=null`.
+        // A transient focus loss is swept by the bounded recheck instead.
+        if (this.clearGate() === 'ok') {
+          this.clearReveal(prev)
+          this.processBlock(prev)
+          this.lastCaretBlock = null
+          this.lastCaretOffset = -1
+          this.rememberReveal(null, null)
+        } else {
+          this.scheduleRevealRecheck()
+          this.processBlock(prev)
+        }
+      } else {
+        this.lastCaretBlock = null
+        this.lastCaretOffset = -1
+        this.rememberReveal(null, null)
       }
       return
     }
-    this.lastCaretOffset = caret.offset
+    this.lastRepairSource = 'caretMove'
+    const trusted = this.isCaretTrustworthy(caret)
+    // v0.4.2: only a *deliberate* move may end a reveal — a click or a key
+    // (see markUserIntent), or a jump to another block. An untrustworthy
+    // read (selection collapsed by Typora's rewrite) must keep it.
+    const allowClear = trusted
+      && (this.hasRecentUserIntent() || caret.block !== this.lastCaretBlock)
+    // Never remember the offset-0 artefact: it would poison every later
+    // fallback that replays `lastCaretOffset` (resolveRevealKeep).
+    if (trusted) this.lastCaretOffset = caret.offset
     if (caret.block === this.lastCaretBlock) {
       // Same block — unit membership may still differ; re-evaluate.
-      this.processCaretBlock(caret.block, caret.offset, caret.anchorEl)
+      this.processCaretBlock(caret.block, caret.offset, caret.anchorEl, allowClear)
       return
     }
     const prev = this.lastCaretBlock
     if (prev && prev.isConnected && containerEl.contains(prev)) {
+      // v0.4.3: moving to another block IS a deliberate leave — but only
+      // when the gate agrees. A bogus read landing in another block while
+      // Typora rebuilds the line must not end the reveal (that was one of
+      // the "chip frame" sources); the recheck sweep then cleans it up.
+      if (allowClear && this.clearGate() === 'ok') this.clearReveal(prev)
+      else if (allowClear) this.scheduleRevealRecheck()
       this.processBlock(prev)
     }
-    this.processCaretBlock(caret.block, caret.offset, caret.anchorEl)
+    this.processCaretBlock(caret.block, caret.offset, caret.anchorEl, allowClear)
   }
 
   /**
@@ -450,6 +972,45 @@ export class CriticRenderService {
     const out: string[] = []
     out.push(`caretOffset=${caret ? caret.offset : 'n/a'}  lastCaretOffset=${this.lastCaretOffset}`)
     out.push(`revealKey=${JSON.stringify(this.lastRevealKey)}`)
+    // v0.4.3: the TRUTH on the block element vs. the remembered ordinal —
+    // they must agree; a chip flash means the truth was dropped somewhere.
+    out.push(`revealAttr=${JSON.stringify(block.dataset.criticReveal ?? null)}  lastRevealOrdinal=${this.lastRevealOrdinal}`)
+    // v0.4.3.1: wrapper health. `unitSpans` MUST equal the number of
+    // revealed segments — 0 means the spans were wrapped by an older build
+    // (see WRAP_SCHEMA) and the reveal can never be projected onto them.
+    out.push([
+      `schema=${WRAP_SCHEMA}`,
+      `sig=${block.dataset.criticSig ?? '-'}`,
+      `unitSpans=${block.querySelectorAll('[data-critic-unit]').length}`,
+      `rawSpans=${block.querySelectorAll('[data-critic-raw-key]').length}`,
+    ].join('  '))
+    // v0.4.3.1: what the CURRENT caret resolves to, computed but NOT
+    // committed — the dump stays meaningful even after the debug command's
+    // own focus loss (it is a global command and steals focus).
+    const text = block.textContent ?? ''
+    const tokens = text.includes('{')
+      ? parser.parseTokens(text, { mergeAnchored: false })
+      : []
+    const units = buildRevealUnits(block, text, tokens)
+    const now = this.resolveReveal(block, caret ? caret.offset : -1, caret?.anchorEl ?? null, units)
+    out.push(`resolveNow ordinal=${now.ordinal ?? '-'}  units=${units.length}  range=${now.unit ? `[${now.unit.from},${now.unit.to}]` : '-'}`)
+    // v0.4.2: which hook repaired last, and whether it kept or cleared the
+    // reveal. A healthy editing session shows a keep tide with no clears
+    // coming from `guard` / `cursorChange` while typing.
+    out.push([
+      `repairSource=${this.lastRepairSource}`,
+      `repairs=${this.repairCount}`,
+      `kept=${this.keepCount}`,
+      `cleared=${this.clearCount}`,
+      `suppressed=${this.suppressedCount}`,
+      `gate=${this.clearGate(true)}`,
+      `caretTrusted=${this.isCaretTrustworthy(caret)}`,
+      `renderSuspectAge=${Date.now() - this.renderSuspectedAt}ms`,
+      `userIntentAge=${this.userIntentAt ? Date.now() - this.userIntentAt : -1}ms`,
+    ].join('  '))
+    // v0.4.3: the last decisions — "suppress" entries while typing are the
+    // proof that the gate (not luck) is keeping the source view alive.
+    out.push('TRACE: ' + this.revealTrace.slice(-12).join(' | '))
     out.push('TEXT: ' + JSON.stringify(block.textContent ?? ''))
     block.querySelectorAll<HTMLElement>('mark, del, s, strike').forEach(el => {
       const cs = window.getComputedStyle(el)
@@ -469,6 +1030,9 @@ export class CriticRenderService {
   /** Force full reveal of raw markup (plugin unload, accepted-view toggle). */
   unwrapAll(containerEl: HTMLElement): void {
     containerEl.querySelectorAll<HTMLElement>(LEAF_BLOCK_SELECTOR).forEach(block => {
+      // v0.4.3: the reveal truth lives on the block — drop it too, or the
+      // plugin would leave a marker permanently in source view.
+      delete block.dataset.criticReveal
       this.unwrapBlock(block)
     })
     // v0.4.0: our inline !important takeover out-ranks every stylesheet, so
@@ -545,6 +1109,11 @@ export class CriticRenderService {
     this.surgery = false
     this.composing = false
     this.dirtyBlocks.clear()
+    // v0.4.3: stop the bounded recheck sweep.
+    if (this.recheckTimer !== undefined) {
+      window.clearTimeout(this.recheckTimer)
+      this.recheckTimer = undefined
+    }
   }
 
   dispose(): void {
@@ -552,6 +1121,7 @@ export class CriticRenderService {
     this.lastCaretBlock = null
     this.lastCaretOffset = -1
     this.rememberReveal(null, null)
+    this.pendingMissAt = 0
   }
 
   private onGuardMutations(records: MutationRecord[]): void {
@@ -582,34 +1152,70 @@ export class CriticRenderService {
       record.removedNodes.forEach(collect)
     }
     if (blocks.size === 0) return
+    // v0.4.2: any mutation inside the editor opens the window in which a
+    // caret read of offset 0 is mistrusted (Typora rewrites the block and
+    // only restores the caret a few microtasks later).
+    //
+    // v0.4.3: only EDIT-relevant blocks move the timestamp. Typora has
+    // always-running decorative mutations (caret, focus outlines, …) and if
+    // those fed `renderSuspectedAt` the v0.4.3 quiescence rule would never
+    // let a clear through.
+    const isEditingNoise = (block: HTMLElement): boolean =>
+      block === this.lastCaretBlock
+      || block.dataset.criticReveal !== undefined
+      || block.querySelector(WRAPPER_SELECTOR) !== null
+      || (block.textContent ?? '').includes('{')
+    if (Array.from(blocks).some(isEditingNoise)) this.renderSuspectedAt = Date.now()
+    this.lastRepairSource = 'guard'
+    this.repairCount++
 
     // IME composition: never run DOM surgery mid-composition — swapping
     // text nodes under the caret is what duplicated CJK input before.
     // v0.4.0: remember the blocks instead of dropping them, so the repair
     // happens in the compositionend frame (same frame, no painted flash).
     if (this.composing) {
-      for (const block of blocks) this.dirtyBlocks.add(block)
+      const prev = this.lastCaretBlock
+      for (const block of blocks) {
+        this.dirtyBlocks.add(block)
+        // v0.4.3: even without surgery we can carry the truth over when
+        // Typora swapped the <p> mid-composition.
+        if (prev && !prev.isConnected && blocks.size === 1) this.adoptReveal(prev, block)
+      }
       return
     }
 
     const caret = this.findCaret(root)
+    // v0.4.2 — THE fix. The guard is a MICROTASK: it runs right after
+    // Typora's `$(block).html(newHtml)` but BEFORE `undo.exeCommand(i)`
+    // restores the caret. The selection is therefore still the artefact of
+    // the innerHTML rewrite — usually a valid range collapsed at offset 0,
+    // which v0.4.1 happily believed and turned into "no unit at caret" →
+    // `syncRawState(null)` → badge, until the next selectionchange.
+    const trusted = this.isCaretTrustworthy(caret)
+    // v0.4.1: Typora can replace the whole <p> while rebuilding a line, so
+    // lastCaretBlock may point at a DETACHED element while the live caret
+    // block is the freshly inserted one. Adopt the single rebuilt block then.
+    const prevUsable = !!this.lastCaretBlock
+      && this.lastCaretBlock.isConnected
+      && root.contains(this.lastCaretBlock)
+    let adopted = false
     this.surgery = true
     try {
       for (const block of blocks) {
         if (caret && block === caret.block) {
-          this.processCaretBlock(block, caret.offset, caret.anchorEl)
-        } else if (!caret && block === this.lastCaretBlock) {
-          // v0.4.0: the caret is momentarily unreadable (Typora detaches the
-          // caret's text node while re-rendering the line). Rendering this
-          // block as a normal one would CLEAR its .is-raw — the source view
-          // would blink off. Keep it in caret mode with the last known
-          // offset; if that resolves nothing, fall back to the remembered
-          // reveal key so the unit stays revealed.
-          this.processCaretBlock(block, this.lastCaretOffset, null)
-          if (this.lastRevealKey && !block.querySelector('[data-critic-raw-key].is-raw')) {
-            this.syncRawState(block, this.lastRevealKey, null)
-          }
+          this.processCaretBlock(block, caret.offset, caret.anchorEl, trusted)
+        } else if (!trusted && (block === this.lastCaretBlock
+          || (!prevUsable && !adopted && blocks.size === 1))) {
+          // Caret unreadable / collapsed: keep the block in caret mode with
+          // the last known offset and repair only (`allowClear: false`).
+          // v0.4.3: Typora may have swapped the <p> — carry the reveal truth
+          // over to the rebuilt element before re-processing it.
+          adopted = true
+          this.adoptReveal(this.lastCaretBlock, block)
+          this.processCaretBlock(block, this.lastCaretOffset, null, false)
         } else {
+          // v0.4.3: never passes a "may clear" flag any more — a repair pass
+          // can only re-wrap and project.
           this.processBlock(block)
         }
       }
@@ -618,9 +1224,21 @@ export class CriticRenderService {
     }
   }
 
-  private processCaretBlock(block: HTMLElement, caretOffset: number, anchorEl: HTMLElement | null): void {
+  /**
+   * @param allowClear v0.4.2 — `false` marks a REPAIR (mutation guard,
+   * compositionend, post-render hook): the reveal may be refreshed but never
+   * dropped. `true` marks a real re-evaluation (user moved the caret).
+   */
+  private processCaretBlock(
+    block: HTMLElement, caretOffset: number, anchorEl: HTMLElement | null,
+    allowClear = true,
+  ): void {
     this.lastCaretBlock = block
-    if (caretOffset >= 0) this.lastCaretOffset = caretOffset
+    // Only a trustworthy offset may overwrite the remembered one — the
+    // offset-0 artefact would poison every later fallback replay.
+    if (caretOffset > 0 || (caretOffset >= 0 && this.lastCaretOffset < 0)) {
+      this.lastCaretOffset = caretOffset
+    }
     const text = block.textContent ?? ''
     const tokens = text.includes('{')
       ? parser.parseTokens(text, { mergeAnchored: false })
@@ -630,15 +1248,14 @@ export class CriticRenderService {
 
     const reveal = this.resolveReveal(block, caretOffset, anchorEl, units)
 
-    const textSig = (this.acceptedView ? 'A:' : '') + text.length + ':' + hashText(text)
-    const caretSig = (this.acceptedView ? 'A:' : '') + 'C:' + units.length
+    const textSig = WRAP_SCHEMA + ':' + (this.acceptedView ? 'A:' : '') + text.length + ':' + hashText(text)
+    const caretSig = WRAP_SCHEMA + ':' + (this.acceptedView ? 'A:' : '') + 'C:' + units.length
     const expectWraps = tokens.length > 0 || units.some(u => u.kind !== 'token')
 
     // Fast path A — caret stamp current (typing inside a unit): keep the
     // spans, only sync the reveal classes.
     if (block.dataset.criticCaret === caretSig && this.wrappersMatch(block, expectWraps)) {
-      this.rememberReveal(reveal.key, reveal.unit)
-      this.syncRawState(block, reveal.key, reveal.unit)
+      this.commitReveal(block, reveal, units, allowClear)
       return
     }
     // Fast path B — text unchanged since the last full wrap: just stamp
@@ -646,8 +1263,7 @@ export class CriticRenderService {
     // keystroke after a click would destroy the composition session.
     if (block.dataset.criticSig === textSig && this.wrappersMatch(block, expectWraps)) {
       block.dataset.criticCaret = caretSig
-      this.rememberReveal(reveal.key, reveal.unit)
-      this.syncRawState(block, reveal.key, reveal.unit)
+      this.commitReveal(block, reveal, units, allowClear)
       return
     }
 
@@ -657,7 +1273,7 @@ export class CriticRenderService {
     this.unwrapBlock(block)
     const segments: Segment[] = []
     for (const token of tokens) {
-      this.planToken(token, segments)
+      this.planToken(token, segments, units)
     }
     for (const unit of units) {
       if (unit.kind === 'consumed-subst') {
@@ -678,11 +1294,14 @@ export class CriticRenderService {
     block.dataset.criticSig = textSig
     block.dataset.criticCaret = caretSig
     this.restoreCaret(block, caretOffset)
+    // v0.4.3: re-stamp the unit ordinals (wrapping clones / re-parents the
+    // native elements) before the reveal is projected.
+    this.syncConsumedClasses(block, units)
     // v0.4.0: the native mark/del hosting our spans is neutralized by inline
     // !important (CSS alone proved unreliable) — recomputed after every wrap.
     this.neutralizeNativeHosts(block, units)
 
-    // v0.4.0 — THE typing-flash fix.
+    // v0.4.0 — THE typing-flash fix, part 1.
     // `reveal` was resolved BEFORE the surgery, i.e. off the pre-surgery
     // wrapper span, whose data-critic-raw-key is the raw markup WITHOUT the
     // character the user just typed. The spans we just created carry the NEW
@@ -692,12 +1311,51 @@ export class CriticRenderService {
     // Re-locate the caret in the POST-surgery DOM and resolve again: the
     // anchor now sits inside a fresh wrapper carrying the new key (`findCaret`
     // is read-only, so the caret itself is untouched).
+    //
+    // v0.4.1 — part 2, the ACTUAL flash the user still saw.
+    // Typora's brush rebuilds the line ~200ms after each edit from a 200ms
+    // setTimeout, and its brushQueue is async: it saves the selection, does
+    // the DOM surgery inside `await`ed calls, and only restores the selection
+    // (exeCommand) AFTER the awaits. Our guard therefore runs in exactly that
+    // window with the selection hanging on a DETACHED node — findCaret returns
+    // null, and v0.4.0's `: { key: null, unit: null }` fallback CLEARED
+    // .is-raw right there: the badge rendered until the next 150ms
+    // selectionchange brought the source back. That was the per-keystroke
+    // "flashes into a badge, then back to source".
+    //
+    // Rule now (v0.4.2): an untrustworthy caret must never clear the reveal.
+    // Only a caret that is trustworthy AND resolves outside every unit does.
+    //
+    // v0.4.3: the resolution moved to ORDINAL space and the renewal chain
+    // moved into `commitReveal` / `resolveRevealKeep`. Two concrete bugs die
+    // with it: (a) the chain used to be seeded with `caretOffset`, i.e. with
+    // the offset-0 artefact instead of `lastCaretOffset`; (b) its second
+    // step compared the LAST REMEMBERED RAW STRING against freshly rebuilt
+    // spans, which by construction misses after every edit.
     const post = this.findCaret(block)
-    const revealAfter = post
+    let final = post
       ? this.resolveReveal(block, post.offset, post.anchorEl, units)
-      : { key: null, unit: null }
-    this.rememberReveal(revealAfter.key, revealAfter.unit)
-    this.syncRawState(block, revealAfter.key, revealAfter.unit)
+      : { ordinal: null, unit: null }
+    if (final.ordinal == null && !post) {
+      // No readable caret at all (Typora's rewrite destroyed the selection):
+      // continue the unit the caret was already in.
+      final = this.resolveRevealKeep(block, units)
+    }
+    this.commitReveal(block, final, units, allowClear)
+  }
+
+  /**
+   * Generous closed-interval variant of `revealUnitForCaret`: any offset in
+   * [u.from, u.to] hits (no margin shrink). Only used on the renewal chain,
+   * where the offset may be one character stale and the alternative — falling
+   * to the rendered view — is exactly the bug being fixed.
+   */
+  private unitAtOffset(units: RevealUnit[], offset: number): RevealUnit | null {
+    if (offset < 0) return null
+    for (const u of units) {
+      if (offset >= u.from && offset <= u.to) return u
+    }
+    return null
   }
 
   /** The unit whose interior (margin-adjusted) contains the caret offset. */
@@ -725,32 +1383,70 @@ export class CriticRenderService {
   private resolveReveal(
     block: HTMLElement, caretOffset: number, anchorEl: HTMLElement | null,
     units: RevealUnit[],
-  ): { key: string | null; unit: RevealUnit | null } {
+  ): { ordinal: number | null; unit: RevealUnit | null } {
     if (anchorEl) {
+      // v0.4.3: identity is the ORDINAL stamped on the span, not its raw
+      // string — the raw drifts while typing, the ordinal does not.
+      const marked = anchorEl.closest<HTMLElement>('[data-critic-unit]')
+      if (marked && block.contains(marked)) {
+        const n = Number(marked.dataset.criticUnit)
+        if (Number.isInteger(n)) {
+          const byOrdinal = units.find(u => u.index === n)
+          if (byOrdinal) return { ordinal: n, unit: byOrdinal }
+        }
+      }
       const wrapper = anchorEl.closest<HTMLElement>('[data-critic-raw-key]')
       if (wrapper && block.contains(wrapper)) {
         const key = wrapper.dataset.criticRawKey ?? ''
-        if (key) return { key, unit: units.find(u => u.key === key) ?? null }
+        const byKey = key ? units.find(u => u.key === key) : undefined
+        if (byKey) return { ordinal: byKey.index, unit: byKey }
       }
     }
     const byOffset = this.revealUnitForCaret(units, caretOffset)
-    if (byOffset) return { key: byOffset.key, unit: byOffset }
+    if (byOffset) return { ordinal: byOffset.index, unit: byOffset }
     if (anchorEl) {
       const byEl = units.find(u => u.kind !== 'token' && u.el && u.el.contains(anchorEl))
-      if (byEl) return { key: byEl.key, unit: byEl }
+      if (byEl) return { ordinal: byEl.index, unit: byEl }
     }
-    return { key: null, unit: null }
+    return { ordinal: null, unit: null }
+  }
+
+  /**
+   * v0.4.3: the unit whose range is closest to `offset`, if within
+   * `tolerance`. Last resort of the repair fallback chain — it can only fire
+   * while clearing is forbidden, so a slightly generous match is safer than
+   * dropping the source view.
+   */
+  private nearestUnit(units: RevealUnit[], offset: number, tolerance: number): RevealUnit | null {
+    if (offset < 0) return null
+    let best: RevealUnit | null = null
+    let bestDist = Infinity
+    for (const u of units) {
+      const dist = offset < u.from ? u.from - offset : offset > u.to ? offset - u.to : 0
+      if (dist < bestDist) {
+        bestDist = dist
+        best = u
+      }
+    }
+    return best && bestDist <= tolerance ? best : null
   }
 
   /** Cosmetic classes on the native consumed elements (idempotent). */
   private syncConsumedClasses(block: HTMLElement, units: RevealUnit[]): void {
     block.querySelectorAll<HTMLElement>('mark').forEach(mark => {
-      const isUnit = units.some(u => u.kind === 'consumed-anchor' && u.el === mark)
-      mark.classList.toggle('critic-anchor-consumed', isUnit && !this.acceptedView)
+      const unit = units.find(u => u.kind === 'consumed-anchor' && u.el === mark)
+      mark.classList.toggle('critic-anchor-consumed', !!unit && !this.acceptedView)
+      // v0.4.3: the native element carries the unit's ordinal too, so the
+      // reveal projection (and the CSS ordinal safety net) can target the
+      // `==` / `~~` synthesis without re-deriving it from the text.
+      if (unit) mark.dataset.criticUnit = String(unit.index)
+      else delete mark.dataset.criticUnit
     })
     block.querySelectorAll<HTMLElement>('del, s, strike').forEach(del => {
-      const isUnit = units.some(u => u.kind === 'consumed-subst' && u.el === del)
-      del.classList.toggle('critic-consumed-del', isUnit)
+      const unit = units.find(u => u.kind === 'consumed-subst' && u.el === del)
+      del.classList.toggle('critic-consumed-del', !!unit)
+      if (unit) del.dataset.criticUnit = String(unit.index)
+      else delete del.dataset.criticUnit
     })
     // Runs on every pass (fast paths included): Typora can drop the class
     // when it re-renders a block, and the golden mark would come back.
@@ -857,6 +1553,10 @@ export class CriticRenderService {
   /** Put the caret back at `offset` within `block` after DOM surgery. */
   private restoreCaret(block: HTMLElement, offset: number): void {
     if (offset < 0) return
+    // v0.4.3: never restore an offset we do not believe — the offset-0
+    // artefact of Typora's innerHTML rewrite would fling the caret to the
+    // block start (Typora restores the real caret itself a moment later).
+    if (!this.isCaretTrustworthy({ block, offset })) return
     const pos = this.findPosition(block, offset)
     if (!pos) return
     try {
@@ -869,41 +1569,15 @@ export class CriticRenderService {
     } catch { /* best effort */ }
   }
 
-  /**
-   * Toggle the raw-source classes (CSS-only). `revealKey` may come straight
-   * from a wrapper span (typing inside a unit — the parsed raw has drifted,
-   * the wrapper key has not), so it is decoupled from the unit:
-   * - `.is-raw` on every segment carrying `revealKey` (chips flatten; the
-   *   md-meta `==`/`~~` glyphs inside them are shown by the stylesheet).
-   * - consumed units additionally light `.critic-anchor-reveal` /
-   *   `.critic-subst-reveal` on their native element.
-   * Every other element's reveal state is cleared each pass.
-   */
-  private syncRawState(block: HTMLElement, revealKey: string | null, revealUnit: RevealUnit | null): void {
-    const segs = block.querySelectorAll<HTMLElement>('[data-critic-raw-key]')
-    segs.forEach(s => s.classList.toggle('is-raw', !!revealKey && s.dataset.criticRawKey === revealKey))
-    block.querySelectorAll<HTMLElement>('.critic-anchor-reveal').forEach(el => {
-      if (!revealUnit || revealUnit.kind !== 'consumed-anchor' || revealUnit.el !== el) {
-        el.classList.remove('critic-anchor-reveal')
-      }
-    })
-    block.querySelectorAll<HTMLElement>('.critic-subst-reveal').forEach(el => {
-      if (!revealUnit || revealUnit.kind !== 'consumed-subst' || revealUnit.el !== el) {
-        el.classList.remove('critic-subst-reveal')
-      }
-    })
-    if (revealUnit?.kind === 'consumed-anchor' && revealUnit.el) {
-      revealUnit.el.classList.add('critic-anchor-reveal')
-    }
-    if (revealUnit?.kind === 'consumed-subst' && revealUnit.el) {
-      revealUnit.el.classList.add('critic-subst-reveal')
-    }
-  }
-
   private wrappersMatch(block: HTMLElement, expected: boolean): boolean {
     return (block.querySelector(WRAPPER_SELECTOR) !== null) === expected
   }
 
+  /**
+   * v0.4.3: re-wrap a block WITHOUT the caret. The reveal is no longer a
+   * parameter: this method can only PROJECT the block's truth (`syncReveal`),
+   * never clear it — dropping a reveal is `clearReveal()` behind `clearGate`.
+   */
   private processBlock(block: HTMLElement): void {
     const text = block.textContent ?? ''
     const tokens = text.includes('{')
@@ -912,14 +1586,13 @@ export class CriticRenderService {
     const units = buildRevealUnits(block, text, tokens)
     this.syncConsumedClasses(block, units)
 
-    const textSig = (this.acceptedView ? 'A:' : '') + text.length + ':' + hashText(text)
+    const textSig = WRAP_SCHEMA + ':' + (this.acceptedView ? 'A:' : '') + text.length + ':' + hashText(text)
     const expectWraps = tokens.length > 0 || units.some(u => u.kind !== 'token')
     if (block.dataset.criticSig === textSig && this.wrappersMatch(block, expectWraps)) {
-      // Fully rendered and current — just make sure no raw reveal lingers
-      // (the block may have just lost the caret). Blocks the user typed in
-      // while the caret was inside land here too: the full rewrap below
-      // refreshes their (stale) wrapper keys the moment the caret leaves.
-      this.syncRawState(block, null, null)
+      // Fully rendered and current — just re-project the truth. Blocks the
+      // user typed in while the caret was inside land here too: the full
+      // rewrap below refreshes their (stale) wrapper keys.
+      this.syncReveal(block)
       return
     }
 
@@ -927,7 +1600,7 @@ export class CriticRenderService {
 
     const segments: Segment[] = []
     for (const token of tokens) {
-      this.planToken(token, segments)
+      this.planToken(token, segments, units)
     }
     for (const unit of units) {
       if (unit.kind === 'consumed-subst') {
@@ -944,9 +1617,12 @@ export class CriticRenderService {
         .forEach(seg => this.wrapSegment(block, seg))
     }
 
+    // v0.4.3: re-stamp the unit ordinals on the native elements — wrapping
+    // can clone / re-parent them, and the projection keys off `data-critic-unit`.
+    this.syncConsumedClasses(block, units)
     this.neutralizeNativeHosts(block, units)
     block.dataset.criticSig = textSig
-    this.syncRawState(block, null, null)
+    this.syncReveal(block)
   }
 
   private unwrapBlock(block: HTMLElement): void {
@@ -993,9 +1669,12 @@ export class CriticRenderService {
     return { block, offset: pre.toString().length, anchorEl: el }
   }
 
-  private planToken(token: CriticToken, segments: Segment[]): void {
+  private planToken(token: CriticToken, segments: Segment[], units: RevealUnit[]): void {
     const { acceptedView } = this
     const mark = segments.length
+    // v0.4.3: the token's reveal identity is its ordinal, resolved by
+    // token identity (buildRevealUnits keeps the same token objects).
+    const unitIndex = units.find(u => u.kind === 'token' && u.token === token)?.index ?? -1
     const nav = (t: CriticToken): Record<string, string> => ({ 'data-critic-nav-key': t.raw })
     switch (token.type) {
       case 'addition': {
@@ -1055,7 +1734,11 @@ export class CriticRenderService {
     // anchor and every comment reveal independently.
     for (let i = mark; i < segments.length; i++) {
       const s = segments[i]
-      s.attrs = { ...(s.attrs ?? {}), 'data-critic-raw-key': token.raw }
+      s.attrs = {
+        ...(s.attrs ?? {}),
+        'data-critic-raw-key': token.raw,
+        ...(unitIndex >= 0 ? { 'data-critic-unit': String(unitIndex) } : {}),
+      }
     }
   }
 
@@ -1104,7 +1787,11 @@ export class CriticRenderService {
     )
     for (let i = mark; i < segments.length; i++) {
       const s = segments[i]
-      s.attrs = { ...(s.attrs ?? {}), 'data-critic-raw-key': unit.key }
+      s.attrs = {
+        ...(s.attrs ?? {}),
+        'data-critic-raw-key': unit.key,
+        'data-critic-unit': String(unit.index),
+      }
     }
   }
 
@@ -1126,7 +1813,11 @@ export class CriticRenderService {
     )
     for (let i = mark; i < segments.length; i++) {
       const s = segments[i]
-      s.attrs = { ...(s.attrs ?? {}), 'data-critic-raw-key': unit.key }
+      s.attrs = {
+        ...(s.attrs ?? {}),
+        'data-critic-raw-key': unit.key,
+        'data-critic-unit': String(unit.index),
+      }
     }
   }
 
