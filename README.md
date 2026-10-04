@@ -45,6 +45,7 @@ CriticMarkup 修订与批注插件：在 Typora 里标记增/删/改/高亮，�
   - 面板内直接编辑评论正文与类型；文档若已变化则拒绝写回（防错位）
   - 编辑中的卡片不会被编辑器刷新打断
 - 编辑区评论徽章点击 → 打开面板并高亮对应卡片
+- F1 打开/展开面板即自动重扫文档（无需再手动 Refresh）；点击 reply 行跳到该条 reply 自己的源码（comment 头仍跳首条 comment）
 
 ## 渲染行为
 
@@ -70,7 +71,7 @@ CriticMarkup 修订与批注插件：在 Typora 里标记增/删/改/高亮，�
 
 ```bash
 npm install
-npm run test        # vitest（56 用例）
+npm run test        # vitest（35 用例）
 npm run typecheck   # tsc --noEmit
 npm run build       # esbuild -> dist/main.js + dist/main.css
 npm run pack        # 构建 + 打包到 out/（版本化 + latest），并刷新根目录 zip

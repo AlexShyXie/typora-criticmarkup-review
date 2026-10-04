@@ -1,6 +1,24 @@
 # CriticMarkup Review for Typora — 设计决策速查
 
-> v0.4.4（2026-10-04 第十四轮）。所有决策均已用户拍板或由调研证实。
+> v0.4.5（2026-10-04 第十五轮）。所有决策均已用户拍板或由调研证实。
+
+## v0.4.5 面板打开空列表 + reply 行跳到首条 comment（第十五轮）
+
+现象（用户原话）：
+1. F1 打开 Review Panel 后是空的，**每次都要手动点一次 Refresh** 才有内容。
+2. 右侧栏点 reply 行，实测**定位到该线程的 comment 上**，不是被点的那条 reply。
+
+**取证**：
+1. `main.ts` 的 `toggle-review-panel` 命令体只有 `placement.toggle()`；面板数据唯一的更新源是 `mdEditor.on('edit') → schedulePanelRefresh()`。`ReviewView.data` 初值是 `{changes:[],comments:[],…}`，`onOpen()` 只 `render()` ⇒ **首次打开必然渲染空列表**；重新展开时数据是上次编辑的快照（换文件即过期）。与现象 1 完全吻合。
+2. `renderCommentCard()` 里 reply 行的 `scheduleNav` 调的是同一个 `navigate()`，而 `onNavigateComment(entry)` **不带索引**；`ReviewController.navigateComment()` 固定用 `thread.first.raw` 当定位键 ⇒ 无论点哪一行都跳首条 comment。现象 2 属实。
+3. 可行性：reply 是完整 `CommentToken`（`raw` = 它自己的 `{>>…<<}`，`anchored` 为 null）；渲染器 `planComment()` 给每条评论（含 reply）打 `data-critic-nav-key = t.raw`，raw 文本以 `font-size:0` 留在 DOM ⇒ `findNavTarget` 属性能命中 reply 徽章，`moveCaretToKey`（落点 `{>>` 之后）会 reveal 该单元。
+
+**修法**：
+1. **面板打开即刷新（双保险）**：① `ReviewView.onOpen()` 末尾回调新增的 `onPanelOpened()` → `controller.refreshPanel()`（覆盖"视图首次挂载"）；② `toggle-review-panel` 在 `placement.toggle()` 后用新的 `refreshReviewPanel(delay)`（= `renderService.process()` + `refreshPanel()`，与 Refresh 按钮同款）刷一次，并 400ms 后再刷一次兜住异步创建的 leaf。新增 `RightDockPlacement.isVisible()`（leaf 存在 **且** `rightSplit.collapsed !== true`；核心无该字段时退化为"leaf 存在即可见"），**只在面板真的可见时才刷新**——收起时不白跑一遍全文档 re-wrap。`refresh-review` 命令与 onload 的 300ms 首扫一并复用该方法（消重）。
+2. **reply 精准跳转**：`onNavigateComment(entry, replyIndex?)`；`navigateComment` 取 `thread.replies[replyIndex]`（索引缺失/越界回落 `thread.first`），用该 token 的 `raw` 当 key 走既有链路。抽纯函数 `commentNavKey(token)` 收敛"是否切掉锚定 `{==..==}` 前缀"，`navigateComment` / `replaceThread` / `resolveComment` / `stripToken` 四处共用（原先是四份手写 slice）。
+3. `head.onclick` 由 `= navigate` 改成 `() => navigate()`：否则 MouseEvent 会被当成 `replyIndex` 传进去（新增可选参数的经典陷阱）。
+
+**不改的部分**：`REPLY_NAV_DELAY = 220` 与双击编辑语义、跳转前清空 `editingKey/editingReply/replyingKey`、写回后的 `schedulePanelRefresh()`（250ms panel-only，防打字被打断）。
 
 ## v0.4.4 徽章点击定位：点 comment / reply 徽章光标进不去（第十四轮）
 
@@ -215,8 +233,8 @@ v0.4.0 / v0.4.1 都还在闪 —— 本轮直接读 `D:\Program Files\Typora\res
 
 ## 交付状态
 
-- vitest 32/32 全绿（critic-thread 14 + critic-core 9 + comment-caret-offset 9）；tsc --noEmit 零错误；esbuild 生产构建通过
-- 产物：`npm run pack` → out/criticmarkup-review-<version>/ + 同名 zip + out/latest/ + out/criticmarkup-review.zip；`npm run deliver` 再拷进 `…\community-plugins\plugins\criticmarkup-review-delivery`（v0.4.4 已交付）
+- vitest 35/35 全绿（critic-thread 17 + critic-core 9 + comment-caret-offset 9）；tsc --noEmit 零错误；esbuild 生产构建通过
+- 产物：`npm run pack` → out/criticmarkup-review-<version>/ + 同名 zip + out/latest/ + out/criticmarkup-review.zip；`npm run deliver` 再拷进 `…\community-plugins\plugins\criticmarkup-review-delivery`（v0.4.5 已交付）
 - 构建必须用 `npm run build`（= `node build.js --prod`）才会 minify；直接 `node build.js` 出的是带 sourcemap 的开发包
 - v0.4.0 的两个问题（打字闪烁、锚点金黄）均已修复（根因见上）；**修复效果待用户实机复测**
 - 锚点若仍偏金黄：F1 跑 `Debug: Dump Block DOM at Cursor`，把剪贴板内容贴回来即可精确定位
@@ -229,6 +247,8 @@ v0.4.0 / v0.4.1 都还在闪 —— 本轮直接读 `D:\Program Files\Typora\res
 - 面板编辑豁免：controller.writeBackCounter > 0 期间 edit 事件不触发 refreshPanel（防打字被打断）
 - 空评论流：插入 → 面板 open → 550ms 后 refreshPanel + focusByNavKey 直接聚焦编辑框
 - v0.4.4 徽章点击：`commentCaretOffset(raw)` 算正文起点 → `focusCommentChip(el)`（先 `setReveal` 后 `placeCaret`）→ 回调 `highlightByNavKey` 闪卡片；监听挂在 `attachPointerFocus(#write)`
+- v0.4.5 面板刷新：数据只在 `mdEditor.on('edit')` 时重建 ⇒ 打开/展开面板必须显式刷（`onPanelOpened` + `toggle` 后 `refreshReviewPanel`）；`isVisible()` 用 `rightSplit.collapsed !== true` 判定，收起时不刷
+- v0.4.5 reply 跳转：`onNavigateComment(entry, replyIndex?)` → `commentNavKey(thread.replies[i] ?? thread.first)`；`commentNavKey` 是"去锚定前缀"的唯一出处（thread.ts）
 - ReviewView 构造签名：(leaf, callbacks, settings?)——containerEl 自建于 section 元素
 - 'typora' 类型解析：npm 别名 `@types/typora@npm:@typora-community-plugin/typora-types`（与官方 example 同款）
 - 设置页：SettingTab 基类 addSettingTitle/addSetting + addText/addSelect/addCheckbox

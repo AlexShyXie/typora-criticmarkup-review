@@ -120,7 +120,10 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
           onAcceptChange: e => this.controller.acceptChange(e),
           onRejectChange: e => this.controller.rejectChange(e),
           onNavigateChange: e => this.controller.navigateChange(e),
-          onNavigateComment: e => this.controller.navigateComment(e),
+          onNavigateComment: (e, replyIndex) => this.controller.navigateComment(e, replyIndex),
+          // v0.4.5: a freshly mounted view starts with the empty default
+          // dataset — give it a real scan instead of waiting for an edit.
+          onPanelOpened: () => this.controller.refreshPanel(),
           onEditComment: (e, body, tag) => this.controller.editComment(e, body, tag),
           onReplyComment: (e, body) => this.controller.replyComment(e, body),
           onEditReply: (e, index, body) => this.controller.editReply(e, index, body),
@@ -154,10 +157,7 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
     }))
 
     if (this.settings.get('autoOpenPanel')) this.placement.open()
-    setTimeout(() => {
-      this.renderService.process(editor.writingArea)
-      this.controller.refreshPanel()
-    }, 300)
+    this.refreshReviewPanel(300)
   }
 
   onunload() {
@@ -192,12 +192,20 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
     })
     cmd('copy-clean-text', 'Copy Clean Text (All Accepted)', () => this.copyCleanText())
     cmd('toggle-accepted-view', 'Toggle Accepted View', () => this.toggleAcceptedView())
-    cmd('toggle-review-panel', 'Toggle Review Panel', () => this.placement.toggle(), 'global')
-    cmd('debug-dump-block', 'Debug: Dump Block DOM at Cursor', () => this.dumpBlockDom(), 'global')
-    cmd('refresh-review', 'Refresh Review Panel', () => {
-      this.renderService.process(editor.writingArea)
-      this.controller.refreshPanel()
+    cmd('toggle-review-panel', 'Toggle Review Panel', () => {
+      this.placement.toggle()
+      // v0.4.5: panel entries are only rebuilt on document edits, so a panel
+      // opened (or re-expanded) by this command showed a stale — or empty —
+      // list until the user hit Refresh. Refresh whenever it ended up
+      // visible; the late second pass covers the leaf the command may have
+      // just created asynchronously.
+      if (this.placement.isVisible()) this.refreshReviewPanel(60)
+      setTimeout(() => {
+        if (this.placement.isVisible()) this.refreshReviewPanel(0)
+      }, 400)
     }, 'global')
+    cmd('debug-dump-block', 'Debug: Dump Block DOM at Cursor', () => this.dumpBlockDom(), 'global')
+    cmd('refresh-review', 'Refresh Review Panel', () => this.refreshReviewPanel(0), 'global')
   }
 
   private runQuickAction(action: QuickActionType): void {
@@ -401,5 +409,18 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
     this.refreshTimer = window.setTimeout(() => {
       this.controller.refreshPanel()
     }, 250)
+  }
+
+  /**
+   * v0.4.5: full re-scan — re-render the editor (so every chip carries its
+   * nav key again) and rebuild the panel from the live markdown. Used by the
+   * Refresh button/command and whenever the panel becomes visible.
+   */
+  private refreshReviewPanel(delay = 0): void {
+    window.clearTimeout(this.refreshTimer)
+    this.refreshTimer = window.setTimeout(() => {
+      this.renderService.process(editor.writingArea)
+      this.controller.refreshPanel()
+    }, delay)
   }
 }

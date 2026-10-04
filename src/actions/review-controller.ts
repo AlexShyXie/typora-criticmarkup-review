@@ -12,6 +12,7 @@ import {
   buildThreadRemoval,
   buildThreadWithEditedReply,
   buildThreadWithNewBody,
+  commentNavKey,
 } from '../critic/thread'
 import type {
   ChangePanelEntry,
@@ -248,9 +249,16 @@ export class ReviewController {
     this.navigateTo(this.findNavTarget(entry.token.raw), entry.token.raw)
   }
 
-  navigateComment(entry: CommentPanelEntry): void {
-    const key = entry.thread.first.raw
-      .slice(entry.thread.first.anchored ? entry.thread.first.anchored.highlightRaw.length : 0)
+  /**
+   * Jump to one comment token: the thread head by default, or the reply at
+   * `replyIndex` when a reply row was clicked (v0.4.5 — every comment block,
+   * replies included, is its own reveal unit with its own chip / nav key, so
+   * the row that was clicked is the row we land on).
+   */
+  navigateComment(entry: CommentPanelEntry, replyIndex?: number): void {
+    const reply = replyIndex === undefined ? null : entry.thread.replies[replyIndex] ?? null
+    const token = reply ?? entry.thread.first
+    const key = commentNavKey(token)
     this.navigateTo(this.findNavTarget(key), key)
   }
 
@@ -300,8 +308,7 @@ export class ReviewController {
     if (thread.anchor) {
       // Resolve keeps the anchored text as PLAIN text: the whole
       // `{==..==}{>>..<<}` region collapses to the anchor text.
-      const anchored = thread.first.anchored
-      const key = thread.first.raw.slice(anchored ? anchored.highlightRaw.length : 0)
+      const key = commentNavKey(thread.first)
       const hint = this.findThreadAnchor(key) ?? this.findNavTarget(key)
       // Pre-reload the DOM holds the literal highlight; after a Typora
       // reload the `{==..==}` is consumed into a native <mark> and the DOM
@@ -344,7 +351,7 @@ export class ReviewController {
       case 'comment': {
         const t = token as CommentToken
         if (t.anchored) {
-          const key = t.raw.slice(t.anchored.highlightRaw.length)
+          const key = commentNavKey(t)
           const hint = this.findThreadAnchor(key) ?? this.findNavTarget(key)
           this.replaceFirstMatch([
             { expected: t.raw, replacement: t.anchored.text },
@@ -375,8 +382,7 @@ export class ReviewController {
 
   private replaceThread(thread: CommentThread, rewritten: string): void {
     const anchored = thread.first.anchored
-    const key = thread.first.raw
-      .slice(anchored ? anchored.highlightRaw.length : 0)
+    const key = commentNavKey(thread.first)
     const hint = this.findThreadAnchor(key) ?? this.findNavTarget(key)
     if (!anchored) {
       this.replaceTextRange(thread.raw, rewritten, hint)

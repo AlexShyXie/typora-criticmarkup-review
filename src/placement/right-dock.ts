@@ -18,6 +18,8 @@ export interface RightDockApp {
       filterLeaves(predicate: (leaf: RightDockLeaf) => boolean): RightDockLeaf[]
       expand(): void
       toggle(): void
+      /** `WorkspaceSidedock.collapsed`; absent on cores that lack it. */
+      collapsed?: boolean
     }
   }
 }
@@ -51,6 +53,18 @@ export class RightDockPlacement {
 
   isOpen() {
     return this.findLeaf() !== null
+  }
+
+  /**
+   * v0.4.5: the leaf can exist while the dock is folded away. Refreshing a
+   * hidden panel is pure waste (it re-wraps the whole editor on the way), so
+   * the toggle command refreshes only when the panel is actually on screen.
+   * A core without `collapsed` degrades to "leaf exists == visible".
+   */
+  isVisible() {
+    if (!this.findLeaf()) return false
+    const dock = (this.app as unknown as RightDockApp).workspace.rightSplit
+    return dock.collapsed !== true
   }
 
   getView<T = unknown>(): T | null {

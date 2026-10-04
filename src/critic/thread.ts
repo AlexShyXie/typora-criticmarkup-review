@@ -1,6 +1,6 @@
 import { escapeCommentBody } from './escape'
 import { newThreadId, todayString } from './syntax'
-import type { CriticTypeTag } from './types'
+import type { CommentToken, CriticTypeTag } from './types'
 import { parseCommentMeta } from './parser'
 
 /**
@@ -44,6 +44,23 @@ export function buildAnchoredCommentMarkup(
   selection: string, author: string, tag: CriticTypeTag, body: string,
 ): string {
   return `{==${selection}==}${buildPlainCommentMarkup(author, tag, body)}`
+}
+
+/**
+ * v0.4.5: the DOM-space navigation key of ONE comment token — the raw the
+ * renderer stamps on its chip (`data-critic-nav-key`) and the spelling the
+ * live text stream actually holds.
+ *
+ * The parser merges an anchored pair into a single token whose `raw` starts
+ * with the `{==..==}` highlight (`parser.ts`: `comment.raw = highlight.raw +
+ * comment.raw`); the highlight is its own reveal unit and must not be part of
+ * the comment's key. Replies carry no anchor, so their raw is used as-is —
+ * that is what lets a reply row jump to the reply instead of the thread head.
+ */
+export function commentNavKey(token: Pick<CommentToken, 'raw' | 'anchored'>): string {
+  return token.anchored
+    ? token.raw.slice(token.anchored.highlightRaw.length)
+    : token.raw
 }
 
 /**

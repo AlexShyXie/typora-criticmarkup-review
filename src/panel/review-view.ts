@@ -34,7 +34,13 @@ export interface ReviewViewCallbacks {
   onAcceptChange(entry: ChangePanelEntry): void
   onRejectChange(entry: ChangePanelEntry): void
   onNavigateChange(entry: ChangePanelEntry): void
-  onNavigateComment(entry: CommentPanelEntry): void
+  /**
+   * Jump to `entry`'s first comment, or — when `replyIndex` is given — to
+   * that reply (v0.4.5).
+   */
+  onNavigateComment(entry: CommentPanelEntry, replyIndex?: number): void
+  /** v0.4.5: the view just opened — hand it a fresh dataset right away. */
+  onPanelOpened(): void
   onEditComment(entry: CommentPanelEntry, body: string, tag: CriticTypeTag): void
   onReplyComment(entry: CommentPanelEntry, body: string): void
   onEditReply(entry: CommentPanelEntry, replyIndex: number, body: string): void
@@ -109,6 +115,10 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
       setTimeout(() => this.flushPendingRender(), 0)
     })
     this.render()
+    // v0.4.5: `this.data` is still the empty default on the very first
+    // render — ask the controller for a real scan instead of showing an
+    // empty panel until the next document edit (or a manual Refresh).
+    this.callbacks.onPanelOpened()
   }
 
   refresh(data: ReviewPanelData, force = false): void {
@@ -389,17 +399,18 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
 
     // Navigating from the panel closes any open editor box first (the box
     // used to linger forever when clicking other entries).
-    const navigate = () => {
+    // v0.4.5: `replyIndex` targets ONE reply of the thread; without it the
+    // jump lands on the thread's first comment.
+    const navigate = (replyIndex?: number) => {
       this.editingKey = null
       this.replyingKey = null
       this.editingReply = null
       this.render()
-      this.callbacks.onNavigateComment(entry)
+      this.callbacks.onNavigateComment(entry, replyIndex)
     }
 
     const head = document.createElement('div')
     head.className = 'critic-card-head'
-    head.onclick = navigate
 
     const badge = document.createElement('span')
     badge.className = `critic-badge critic-badge-tag-${entry.thread.first.typeTag.toLowerCase()}`
@@ -412,6 +423,10 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
     if (entry.thread.first.date) bits.push(entry.thread.first.date)
     bits.push(`Line ${entry.thread.line}`)
     meta.textContent = bits.join(' · ')
+
+    // Wrapped: `navigate` takes an optional reply index, so the click's
+    // MouseEvent must not be forwarded as one (v0.4.5).
+    head.onclick = () => navigate()
 
     head.append(badge, meta)
 
@@ -472,14 +487,15 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
           )?.focus()
         }
         const openEdit = (e: MouseEvent) => open(e)
-        // v0.4.3.2: single click on a reply row NAVIGATES (same thread, same
-        // anchor as the comment head — clicking a comment jumps, a reply
-        // belongs to that very comment). Deferred + cancellable so the
-        // double-click-to-edit gesture keeps working (see REPLY_NAV_DELAY).
+        // v0.4.3.2: single click on a reply row NAVIGATES. Deferred +
+        // cancellable so the double-click-to-edit gesture keeps working (see
+        // REPLY_NAV_DELAY).
+        // v0.4.5: it jumps to THIS reply (its own `{>>…<<}` block), not to
+        // the thread head — a reply is its own reveal unit.
         let navTimer: number | undefined
         const scheduleNav = () => {
           window.clearTimeout(navTimer)
-          navTimer = window.setTimeout(() => navigate(), REPLY_NAV_DELAY)
+          navTimer = window.setTimeout(() => navigate(replyIndex), REPLY_NAV_DELAY)
         }
         const cancelNav = () => window.clearTimeout(navTimer)
         const openEditNow = (e: MouseEvent) => {
