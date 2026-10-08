@@ -21,7 +21,10 @@ import {
   buildHighlight,
   buildSubstitution,
 } from './critic/markup'
-import { buildAnchoredCommentMarkup } from './critic/thread'
+import {
+  buildAnchoredCommentMarkup,
+  buildStandaloneCommentMarkup,
+} from './critic/thread'
 import { acceptAll } from './critic/resolve'
 
 export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
@@ -270,14 +273,28 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
 
   private insertCommentFromSelection(): void {
     const selection = this.getSelectionText()
-    if (!selection) {
-      editor.EditHelper.showNotification('CriticMarkup: select some text first')
-      return
-    }
     const author = this.settings.get('authorName')
     const tag = this.settings.get('defaultTypeTag')
-    const markup = buildAnchoredCommentMarkup(selection, author, tag, '')
-    const navKey = markup.slice(selection.length + 6) // comment part only
+
+    let markup: string
+    let navKey: string
+    if (selection) {
+      // Anchored: `{==selection==}{>>Hui|NOTE: <<}` (unchanged design).
+      markup = buildAnchoredCommentMarkup(selection, author, tag, '')
+      navKey = markup.slice(selection.length + 6) // comment part only
+    } else {
+      // Anchorless note at the caret: `{>>rc-xxxxxx|Hui|2026-10-08|NOTE: <<}`.
+      // The id is its identity — replies append without an upgrade rewrite
+      // and the panel key is stable from the start. Guard: inserting inside
+      // existing critic markup would nest and break parsing.
+      if (findCursorTarget()) {
+        editor.EditHelper.showNotification(
+          'CriticMarkup: move the cursor out of existing markup first')
+        return
+      }
+      markup = buildStandaloneCommentMarkup(author, tag)
+      navKey = markup // anchorless: the whole raw IS the comment key
+    }
     replaceSelectionWith(editor, markup)
 
     // Open panel + focus the empty comment for immediate typing.

@@ -26,7 +26,10 @@ interface CommentFields {
 function buildCommentMarkup(f: CommentFields): string {
   const parts: string[] = []
   if (f.id) parts.push(f.id)
-  if (f.author !== null && f.author !== '') parts.push(f.author)
+  // Escape the author like the body: a `|` in the name would otherwise
+  // split into phantom meta fields (the parser side already unescapes
+  // symmetrically — only the writer was missing).
+  if (f.author !== null && f.author !== '') parts.push(escapeCommentBody(f.author))
   if (f.id && f.date) parts.push(f.date)
   const body = escapeCommentBody(f.body)
   return `{>>${parts.join('|')}${parts.length ? '|' : ''}${f.typeTag}: ${body}<<}`
@@ -37,6 +40,21 @@ export function buildPlainCommentMarkup(
   author: string, tag: CriticTypeTag, body: string,
 ): string {
   return buildCommentMarkup({ id: null, author, date: null, typeTag: tag, body })
+}
+
+/**
+ * `{>>rc-xxxxxx|Hui|2026-10-08|NOTE: <<}` — standalone (anchorless) comment,
+ * inserted at the caret when nothing is selected. Starts with the thread id
+ * + date right away: an anchorless comment has no highlight to navigate by,
+ * so the id IS its identity — replies append to the same thread without an
+ * upgrade rewrite, and the panel keeps a stable entry key from day one.
+ */
+export function buildStandaloneCommentMarkup(
+  author: string, tag: CriticTypeTag,
+): string {
+  return buildCommentMarkup({
+    id: newThreadId(), author, date: todayString(), typeTag: tag, body: '',
+  })
 }
 
 /** `{==selection==}{>>Hui|NOTE: body<<}` — anchored comment. */
