@@ -560,9 +560,14 @@ textarea.critic-modal-input {
   transition: border-color 0.15s ease;
 }
 
+/* v0.4.8: egg-yellow flash — the caret settling inside markup (or a chip
+   click) scrolls the matching card into view and lights it for 1s. */
 .critic-card.is-flash {
-  border-color: #3f87c5;
-  box-shadow: 0 0 0 2px rgba(63, 135, 197, 0.25);
+  border-color: #e0a616;
+  background: rgba(250, 205, 70, 0.35);
+  box-shadow: 0 0 0 2px rgba(250, 205, 70, 0.30);
+  transition: border-color 0.15s ease, background-color 0.15s ease,
+    box-shadow 0.15s ease;
 }
 
 .critic-card-head {

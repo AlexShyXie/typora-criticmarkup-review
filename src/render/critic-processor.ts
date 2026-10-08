@@ -6,6 +6,7 @@ import {
 } from '../critic/consumed'
 import { SYNTAX } from '../critic/syntax'
 import { commentCaretOffset } from '../critic/comment-caret'
+import { caretUnitNavKey } from '../critic/caret-nav'
 import type {
   AdditionToken,
   CommentToken,
@@ -506,11 +507,57 @@ export class CriticRenderService {
   private pendingChip: { el: HTMLElement; navKey: string } | null = null
   /** Plugin hook fired after a chip click parked the caret successfully. */
   private chipFocusHook: ((navKey: string) => void) | null = null
+  /**
+   * v0.4.8: fired when the caret settles inside a reveal unit (any critic
+   * markup: change token, comment, consumed shape). The payload is the
+   * SOURCE-file spelling of the unit — comments arrive as their nav key
+   * (anchor stripped), consumed shapes are re-synthesized (`{x}` →
+   * `{==x==}`, `{a~>b}` → `{~~a~>b~~}`) so the panel can match its
+   * file-space entries. Debounced: re-fires only when the unit CHANGES, and
+   * a clear re-arms the same unit.
+   */
+  onCaretUnit: ((navKey: string) => void) | null = null
+  private lastNotifiedUnitKey: string | null = null
+  /**
+   * v0.4.8 r3: swallow the next caret-unit notification. Panel → editor
+   * navigation lands the caret inside the target markup, and that arrival
+   * used to flash the very card the user just clicked. One-shot with an
+   * expiry: if no notification follows (target === current markup, so the
+   * unit-debounce swallows it anyway), the flag self-clears and the next
+   * DIRECT click in the editor still flashes.
+   */
+  private suppressCaretFlashUntil = 0
+
+  /** v0.4.8 r3: call right before a programmatic jump into markup. */
+  suppressNextCaretFlash(): void {
+    this.suppressCaretFlashUntil = Date.now() + 800
+  }
 
   private rememberReveal(ordinal: number | null, unit: RevealUnit | null): void {
     this.lastRevealOrdinal = ordinal
     this.lastRevealUnit = unit
     this.lastRevealKey = unit?.key ?? null
+  }
+
+  /**
+   * v0.4.8: hand the settled unit's source spelling to the host (panel
+   * highlight). Fires only when the unit changes — commitReveal runs on
+   * every selectionchange, so without this guard the panel would flash on
+   * each keystroke inside the markup.
+   */
+  private notifyCaretUnit(unit: RevealUnit | null): void {
+    if (!this.onCaretUnit || !unit) return
+    if (unit.key === this.lastNotifiedUnitKey) return
+    this.lastNotifiedUnitKey = unit.key
+    // v0.4.8 r3: panel navigation's caret arrival — swallowed. The debounce
+    // state still advances (the unit HAS been seen), so the suppressed
+    // spelling cannot resurface on the next commitReveal of the same unit.
+    if (Date.now() < this.suppressCaretFlashUntil) {
+      this.suppressCaretFlashUntil = 0 // one-shot
+      return
+    }
+    const navKey = caretUnitNavKey(unit)
+    if (navKey) this.onCaretUnit(navKey)
   }
 
   /** v0.4.2: called from the plugin on mousedown / click / keyup. */
@@ -936,11 +983,15 @@ export class CriticRenderService {
       this.keepCount++
       this.setReveal(block, final.ordinal, final.unit)
       this.traceDecision(final.ordinal, 'reveal')
+      this.notifyCaretUnit(final.unit)
       return
     }
     if (allowClear && this.clearGate() === 'ok') {
       this.clearCount++
       this.rememberReveal(null, null)
+      // Left the markup: re-arm the same unit so re-entering it flashes the
+      // panel again.
+      this.lastNotifiedUnitKey = null
       this.clearReveal(block)
       this.traceDecision(null, 'clear')
       return

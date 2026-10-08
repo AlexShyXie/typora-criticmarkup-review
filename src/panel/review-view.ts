@@ -108,6 +108,8 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
   private replyingKey: string | null = null
   /** Data arrived while the user was interacting; render on focusout. */
   private pendingRender = false
+  /** v0.4.8: active card flash timer (restarted on every hit). */
+  private flashTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -204,29 +206,56 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
   }
 
   /**
-   * Flash a comment card (e.g. clicked chip in editor).
+   * Flash a comment or change card (e.g. clicked chip in editor, or the
+   * caret settling inside markup — v0.4.8).
    *
    * v0.4.4: the editor hands over the nav key of the chip that was clicked,
    * and that chip may be a REPLY — whose raw is neither `thread.first.raw`
    * nor the comment-only slice of it. The thread's full raw (first comment +
    * every reply) is therefore matched as a third case, so clicking a reply
    * badge highlights the card holding the whole thread.
+   *
+   * v0.4.8: change cards too (matched by file-space raw — the renderer
+   * re-synthesizes consumed spellings before handing over). Never disturbs
+   * an in-progress editor box; repeated hits restart the 1s flash timer.
    */
   highlightByNavKey(navKey: string): void {
-    const entry = this.data.comments.find(c => {
+    // Do not yank focus/scroll while the user is typing in the panel.
+    if (this.isInteracting()) return
+    const card = this.findCardByNavKey(navKey)
+    if (!card) return
+    // v0.4.8 r2: rapid clicks between markups used to leave stale flashes —
+    // the single timer was cleared (cancelling the previous card's removal
+    // callback) before being re-armed for the new card, so every card but
+    // the last one kept `is-flash` forever. Clear EVERY lit card first:
+    // exactly one card is lit at any moment, and its removal is the only
+    // timer in flight. Same-card re-hits re-run the CSS transition too
+    // (cleared then added), so the reflow hack is gone.
+    this.containerEl.querySelectorAll('.critic-card.is-flash')
+      .forEach(el => el.classList.remove('is-flash'))
+    card.classList.add('is-flash')
+    card.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    if (this.flashTimer !== null) clearTimeout(this.flashTimer)
+    this.flashTimer = setTimeout(() => card.classList.remove('is-flash'), 1000)
+  }
+
+  private findCardByNavKey(navKey: string): HTMLElement | null {
+    let id: string | null = null
+    const comment = this.data.comments.find(c => {
       const first = c.thread.first
       const commentOnly = first.raw.slice(first.anchored ? first.anchored.highlightRaw.length : 0)
       return commentOnly === navKey
         || first.raw === navKey
         || c.thread.raw.includes(navKey)
     })
-    if (!entry) return
-    const card = this.containerEl.querySelector(`[data-entry-id="${CSS.escape(entry.id)}"]`)
-    if (card) {
-      card.classList.add('is-flash')
-      card.scrollIntoView({ block: 'nearest' })
-      setTimeout(() => card.classList.remove('is-flash'), 1200)
+    if (comment) id = comment.id
+    else {
+      const change = this.data.changes.find(e => e.token.raw === navKey)
+      if (change) id = change.id
     }
+    if (!id) return null
+    return this.containerEl.querySelector<HTMLElement>(
+      `[data-entry-id="${CSS.escape(id)}"]`)
   }
 
   // ------------------------------------------------------------- rendering
@@ -326,6 +355,7 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
   private renderChangeCard(entry: ChangePanelEntry): HTMLElement {
     const card = document.createElement('div')
     card.className = `critic-card critic-change critic-change-${entry.token.type}`
+    card.dataset.entryId = entry.id
 
     // Navigating closes any open comment editor box (issue: box lingered).
     const navigate = () => {
@@ -422,6 +452,7 @@ export class ReviewView extends WorkspaceView implements ReviewViewActions {
   private renderCommentCard(entry: CommentPanelEntry): HTMLElement {
     const card = document.createElement('div')
     card.className = 'critic-card critic-comment-card'
+    card.dataset.entryId = entry.id
 
     // Navigating from the panel closes any open editor box first (the box
     // used to linger forever when clicking other entries).

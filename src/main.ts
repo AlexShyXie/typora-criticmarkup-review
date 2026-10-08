@@ -43,6 +43,12 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
 
     this.controller = new ReviewController(this.app, this.settings)
     this.renderService = new CriticRenderService()
+    // v0.4.8: caret settles inside markup -> flash the matching panel card
+    // (scrolls it into view, egg-yellow for 2s). No-op while the dock is
+    // closed (getView() is null) or a panel editor box has focus.
+    this.renderService.onCaretUnit = (navKey) => {
+      this.placement.getView<ReviewView>()?.highlightByNavKey(navKey)
+    }
     // Write-backs settle early (park caret + direct re-render) instead of
     // waiting for the framework's ~400ms observer round-trip.
     this.controller.setAfterWrite(() => this.renderService.process(editor.writingArea))
@@ -122,8 +128,17 @@ export default class CriticReviewPlugin extends Plugin<ReviewSettings> {
           onQuickAction: a => this.runQuickAction(a),
           onAcceptChange: e => this.controller.acceptChange(e),
           onRejectChange: e => this.controller.rejectChange(e),
-          onNavigateChange: e => this.controller.navigateChange(e),
-          onNavigateComment: (e, replyIndex) => this.controller.navigateComment(e, replyIndex),
+          // v0.4.8 r3: swallow the caret flash the jump itself causes —
+          // flashing the card the user just clicked is noise, the flash is
+          // for DIRECT clicks inside the editor's markup only.
+          onNavigateChange: e => {
+            this.renderService.suppressNextCaretFlash()
+            this.controller.navigateChange(e)
+          },
+          onNavigateComment: (e, replyIndex) => {
+            this.renderService.suppressNextCaretFlash()
+            this.controller.navigateComment(e, replyIndex)
+          },
           // v0.4.5: a freshly mounted view starts with the empty default
           // dataset — give it a real scan instead of waiting for an edit.
           onPanelOpened: () => this.controller.refreshPanel(),
